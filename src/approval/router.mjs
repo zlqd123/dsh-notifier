@@ -266,7 +266,7 @@ export function registerApprovalHandler(deps) {
     // 判定不出出站面时（无 router 分流且 notifier 未暴露渠道表——旧式装配/测试台架）
     // 广播目标记为 null = 保持上游行为全量广播，绝不静默跳过。
     const filterDedup = (types) => types.filter((type) => {
-      if (!outboundKnown.has(type)) return false // 别名展开出的入站名（如 'qq'）不进广播
+      if (outboundKnown.size > 0 && !outboundKnown.has(type)) return false // 出站表可得时，别名展开出的入站名（如 'qq'）不进广播
       const alias = INTERACTIVE_ALIASES[String(type)]
       if (alias === undefined) return true // 无别名映射的渠道：保持上游双发行为
       return !cardedInteractive.has(alias) // 仅 qq 官方 bot：卡片已送达则跳过广播
