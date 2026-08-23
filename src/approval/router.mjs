@@ -13,7 +13,7 @@
 // 远程 bus.wait 与下游结果竞速、先答先算；缺省 false 为排他瀑布（等待期不询问桌面）。
 
 import { createEscalationChain } from './escalation.mjs'
-import { normalizeInbound } from '../inbound/_contract.mjs'
+import { normalizeInbound, parseApprovalAction } from '../inbound/_contract.mjs'
 import { guardTargets } from '../inbound/target-guard.mjs'
 import { workspaceOf } from '../routing/session-registry.mjs'
 
@@ -29,6 +29,13 @@ const DISPLAY_NAMES = {
   wechat: '微信',
   dingtalk: '钉钉',
 }
+
+// 出站渠道类型 → 入站交互渠道名的显式别名表（严格逐名映射，无通配）。
+// dsh-notifier 的 QQ 只有一种实现（官方机器人），但注册了两个名字：入站交互
+// 渠道 'qq'（WS 网关）、出站通知渠道 'qq-bot'（REST）——不同适配器、不同投递面，
+// 必须严格区分。本表仅桥接这一对名字；未来若新增其他 QQ 实现（onebot/qmsg 等）
+// 各自独立注册、绝不共用别名。
+const INTERACTIVE_ALIASES = Object.freeze({ 'qq-bot': 'qq' })
 
 // 升级链默认节奏：30s / 60s 各再提醒一轮（timeoutMs 默认 120s 内完成两轮升级）
 const DEFAULT_ESCALATION_STAGES = [
@@ -167,7 +174,19 @@ export function registerApprovalHandler(deps) {
     try {
       const globalTypes = Array.isArray(notifier?.channels) ? notifier.channels : []
       const { channelTypes } = router.resolveOutbound(String(agentId), workspaceOf(request.agent), globalTypes)
-      return channelTypes
+      if (!Array.isArray(channelTypes)) return channelTypes
+      // v0.8.4 QQ 渠道别名修复：出站适配器注册名是 'qq-bot'，入站交互渠道名是 'qq'，
+      // 两者不同名（同一官方机器人实现的两个投递面，见 INTERACTIVE_ALIASES 注）。
+      // 分流结果只含出站名时 planApprovalTargets 会把 qq 交互渠道整体过滤掉——卡片
+      // 零发送、pushedTo 恒空、编号回复 intended 兜底失效（裸数字漏进会话路由，
+      // 2026-08-23 全天事故链的总根因）。这里把出站名展开为「出站名 + 别名入站名」
+      // 并入集合；广播侧未知类型由 notifyAll 自然跳过，无副作用。
+      const merged = new Set(channelTypes)
+      for (const type of channelTypes) {
+        const alias = INTERACTIVE_ALIASES[type]
+        if (alias !== undefined) merged.add(alias)
+      }
+      return [...merged]
     } catch {
       return null
     }
@@ -192,7 +211,10 @@ export function registerApprovalHandler(deps) {
 
   async function pushApproval(key, token, request, channelTypes, targetsByChannel) {
     const title = `需要批准：${request.toolName}`
-    const content = `${request.reason ?? 'agent 请求执行一个需要授权的操作'}\n\n批准将仅对本次调用生效（token 单次核销）。`
+    // v0.8.4 双端提示：并行模式下网页弹窗与远程卡片同问，远程先决时网页弹窗成为
+    // 孤儿应答（宿主 api-proxy 无「已解决」广播机制），但迟到点击被首达采纳自然
+    // 忽略、无副作用——文案明示用户可随意处置，避免等待/困惑。
+    const content = `${request.reason ?? 'agent 请求执行一个需要授权的操作'}\n\n批准将仅对本次调用生效（token 单次核销）。\n双端同问、先答先算：一处裁决后即生效，另一端的网页弹窗/卡片可随意关闭或忽略。`
     const pushedTo = []
     const buttonChannels = []
     const textChannels = []
@@ -231,6 +253,28 @@ export function registerApprovalHandler(deps) {
         else textChannels.push(name)
       }
     }
+    // v0.8.4 渠道级去重广播：广播线降级为「未收到卡片的渠道」的兜底（单向渠道、
+    // 卡片发送失败场景）。已成功收到卡片的交互渠道，其出站孪生不再重发纯文本——
+    // 严格按渠道名逐个判断（仅别名命中 carded 才抑制），不做任何跨平台归并。
+    // qq 单渠道拓扑效果：卡片必达 → 广播整体跳过，审批只发一条消息。
+    const cardedInteractive = new Set(pushedTo.map((target) => String(target?.channel ?? '')))
+    const outboundKnown = new Set(Array.isArray(notifier?.channels) ? notifier.channels : [])
+    // ⚠️ 范围声明：广播去重仅测试过 QQ 官方 bot（qq-bot ↔ qq 别名对，同一实现的
+    // 出站/入站两个注册面）。其他平台理论可行但未逐一实测，暂不启用——无别名映射的
+    // 渠道一律保持上游「卡片+广播」双发行为；后续实测一个平台，把名字对加进
+    // INTERACTIVE_ALIASES 即自动纳入去重。
+    // 判定不出出站面时（无 router 分流且 notifier 未暴露渠道表——旧式装配/测试台架）
+    // 广播目标记为 null = 保持上游行为全量广播，绝不静默跳过。
+    const filterDedup = (types) => types.filter((type) => {
+      if (!outboundKnown.has(type)) return false // 别名展开出的入站名（如 'qq'）不进广播
+      const alias = INTERACTIVE_ALIASES[String(type)]
+      if (alias === undefined) return true // 无别名映射的渠道：保持上游双发行为
+      return !cardedInteractive.has(alias) // 仅 qq 官方 bot：卡片已送达则跳过广播
+    })
+    let broadcastTargetTypes = null
+    if (Array.isArray(channelTypes)) broadcastTargetTypes = filterDedup(channelTypes)
+    else if (outboundKnown.size > 0) broadcastTargetTypes = filterDedup([...outboundKnown])
+    if (broadcastTargetTypes !== null && broadcastTargetTypes.length === 0) return pushedTo
     // 全渠道通知（含单向渠道；无按钮渠道靠编号回复降级）
     // 按钮渠道提示可点；无按钮渠道提示编号回复——单向广播渠道（bark 等）同样
     // 依赖「回复 1 批准 / 2 拒绝」兜底，因此按钮场景也保留该提示（v0.2.0 文案契约）。
@@ -243,7 +287,7 @@ export function registerApprovalHandler(deps) {
         ? `${content}\n\n（${channelNotes.join('；')}；无按钮渠道可回复 1 批准 / 2 拒绝）`
         : `${content}\n\n（本渠道无按钮：回复 1 批准 / 2 拒绝）`,
       level: 'timeSensitive',
-    }, channelTypes !== null ? { channelTypes } : {}).catch(() => {})
+    }, broadcastTargetTypes !== null ? { channelTypes: broadcastTargetTypes } : {}).catch(() => {})
     return pushedTo
   }
 
@@ -285,6 +329,68 @@ export function registerApprovalHandler(deps) {
     return true
   }
 
+  // v0.8.4 按钮裁决（QQ INTERACTION_CREATE 显式 key）：envelope.approvalAction 由
+  // qq-gw 从 button_data「ap:<decision>:<approvalKey>:<token>」（契约协议，与
+  // telegram/飞书同构）解析注入。与编号回复的本质区别：key+token 是卡片发送时写进
+  // 按钮的精确值，不做「最近待决」隐式匹配——多行并存、僵尸行、并行竞速都不会再
+  // 劫持目标（2026-08-23 事故根治）。安全链路：
+  //   WS 事件 → bus.accept 身份门（绑定/白名单）→ 此处 pushedTo 用户级校验（群内
+  //   防代点）→ bus.decide 的 HMAC token 验签 + allowChats 会话级校验 → 首达采纳。
+  function handleApprovalAction(envelope) {
+    let action = envelope?.approvalAction
+    // v0.8.4 文本形态兜底：指令按钮/旧客户端会把按钮 data 当文本消息发出（2026-08-23
+    // 实测：action.type=2 的点击以「ap:<decision>:<key>:<token>」文本到达）。能完整
+    // 解析为契约负载的文本按同一裁决路径处理；安全不变——仍过 token 验签 + 接收人 +
+    // allowChats。普通聊天几乎不可能以 ap: 开头且四段结构合法，误伤可忽略。
+    if ((action === null || action === undefined) && typeof envelope?.text === 'string' && envelope.text.startsWith('ap:')) {
+      const parsed = parseApprovalAction(envelope.text.trim())
+      if (parsed !== null) {
+        action = { decision: parsed.decision, approvalKey: parsed.approvalKey, token: parsed.token }
+        warn(`文本形态按钮负载已受理（${envelope.channel} user ${envelope.userId}）`)
+      }
+    }
+    if (action === null || typeof action !== 'object') return false
+    const key = String(action.approvalKey ?? '')
+    const decision = action.decision === OUTCOME_ALLOWED ? OUTCOME_ALLOWED
+      : action.decision === OUTCOME_REJECTED ? OUTCOME_REJECTED : null
+    if (key === '' || decision === null) return false
+    const receipt = (text) => {
+      const inbound = interactiveByChannel.get(envelope.channel)
+      if (inbound === undefined) return
+      void inbound.sendText(envelope.chatId, text).catch(() => {})
+    }
+    const row = ledger.get(key)
+    if (row === undefined || row.status !== 'pending') {
+      warn(`按钮裁决落空 ${key}（状态 ${row?.status ?? '无此行'}，user ${envelope.userId}）`)
+      receipt('该审批已被处理或已失效，此次点击无效')
+      return true
+    }
+    // 用户级校验：卡片送达记录里有明确接收人时，仅接收人可裁决（群场景防他人代点；
+    // 单聊天然匹配）。pushedTo 为空（增量落账窗口）时跳过——allowChats 仍在兜底。
+    const targets = Array.isArray(row.pushedTo) ? row.pushedTo.filter((t) => t?.channel === envelope.channel) : []
+    if (targets.length > 0 && !targets.some((t) => String(t.userId) === String(envelope.userId))) {
+      warn(`按钮裁决拒绝 ${key}：点击者 ${envelope.userId} 非接收人`)
+      receipt('仅审批接收人可点击裁决')
+      return true
+    }
+    const verdict = bus.decide({
+      approvalKey: key,
+      decision,
+      token: typeof action.token === 'string' ? action.token : undefined,
+      via: `${envelope.channel}:button`,
+      userId: envelope.userId,
+      chatId: envelope.chatId,
+    })
+    if (verdict.ok) {
+      warn(`按钮裁决 ${key} → ${decision}（user ${envelope.userId}）`)
+      return true
+    }
+    warn(`按钮裁决落空 ${key}（${verdict.reason ?? 'unknown'}，user ${envelope.userId}）`)
+    receipt('该审批已被处理或已失效，此次点击无效')
+    return true
+  }
+
+  const disposeApprovalAction = bus.onMessage(handleApprovalAction)
   const disposeMessage = bus.onMessage(handleNumberedReply)
 
   const handler = async (request, next) => {
@@ -431,6 +537,7 @@ export function registerApprovalHandler(deps) {
   const disposeApproval = ctx.on('approval/request', handler)
   return () => {
     disposeApproval?.()
+    disposeApprovalAction?.()
     disposeMessage?.()
     escalation.dispose()
   }

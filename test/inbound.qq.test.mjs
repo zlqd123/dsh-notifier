@@ -9,6 +9,8 @@ import { createInboundBus } from '../src/inbound/bus.mjs'
 const API = 'https://api.sgroup.qq.com'
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 const INTENT_GROUP_AND_C2C = 1 << 25
+const INTENT_INTERACTION = 1 << 26 // 按钮化审批：INTERACTION_CREATE 回调（v0.8.4）
+const DEFAULT_INTENTS = INTENT_GROUP_AND_C2C | INTENT_INTERACTION
 
 // ---------------------------------------------------------------- fakes
 
@@ -136,18 +138,18 @@ test('resolveQqInboundConfig：缺凭证 ok=false 中文指引；归一化 notif
   assert.deepEqual(ok.config.notifyUsers, ['u1'])
   assert.deepEqual(ok.config.notifyGroups, ['g1'])
   assert.equal(ok.config.intents, 1)
-  assert.equal(resolveQqInboundConfig({ appId: 'a', appSecret: 's' }).config.intents, INTENT_GROUP_AND_C2C)
+  assert.equal(resolveQqInboundConfig({ appId: 'a', appSecret: 's' }).config.intents, DEFAULT_INTENTS)
 })
 
 // ---------------------------------------------------------------- 网关握手
 
-test('握手：HELLO 后发 IDENTIFY（QQBot token + intents 1<<25）；READY 记录 session', async () => {
+test('握手：HELLO 后发 IDENTIFY（QQBot token + 群私聊|按钮互动 intents）；READY 记录 session', async () => {
   const rig = makeRig()
   const ws = await driveReady(rig)
   const identify = ws.sent.find((frame) => frame.op === 2)
   assert.ok(identify, '应发送 IDENTIFY')
   assert.equal(identify.d.token, 'QQBot AT_TOKEN')
-  assert.equal(identify.d.intents, INTENT_GROUP_AND_C2C)
+  assert.equal(identify.d.intents, DEFAULT_INTENTS)
   assert.deepEqual(identify.d.shard, [0, 1])
   assert.ok(rig.lines.some((line) => line.includes('网关已就绪') && line.includes('sess_1')))
   await rig.inbound.stop()
@@ -279,7 +281,7 @@ test('白名单外/空文本：不入站不抛异常', async () => {
 
 // ---------------------------------------------------------------- 出站能力
 
-test('sendApprovalCard：文本审批通知（无按钮话术）+ msg_seq 递增，返回 messageId', async () => {
+test('sendApprovalCard：按钮卡片优先（msg_type=2 + keyboard 回调按钮）+ msg_seq 递增，返回 messageId', async () => {
   const rig = makeRig()
   await driveReady(rig)
   const card = await rig.inbound.sendApprovalCard({ chatId: 'u_open', title: '需要批准：rm', content: '删除文件', approvalKey: 'ap:rm:1', token: 'tk' })
@@ -287,10 +289,21 @@ test('sendApprovalCard：文本审批通知（无按钮话术）+ msg_seq 递增
   const call = rig.calls.find((entry) => entry.url === `${API}/v2/users/u_open/messages`)
   assert.ok(call, '应 POST 单聊消息接口')
   assert.equal(call.headers.authorization, 'QQBot AT_TOKEN')
-  assert.equal(call.body.msg_type, 0)
+  // v0.8.4 按钮化：markdown + keyboard 长形式，两颗 type=1 回调按钮携带契约负载
+  assert.equal(call.body.msg_type, 2)
   assert.equal(call.body.msg_seq, 1)
-  assert.match(call.body.content, /需要批准：rm/)
-  assert.match(call.body.content, /回复 1 批准 \/ 2 拒绝/)
+  assert.match(call.body.markdown.content, /需要批准：rm/)
+  assert.match(call.body.markdown.content, /点击按钮完成裁决/)
+  const buttons = call.body.keyboard.content.rows[0].buttons
+  assert.equal(buttons.length, 2)
+  assert.equal(buttons[0].render_data.label, '✅ 批准')
+  assert.equal(buttons[1].render_data.label, '❌ 拒绝')
+  for (const [index, decision] of ['allowed-once', 'rejected'].entries()) {
+    assert.equal(buttons[index].action.type, 1, '必须是回调按钮（type=2 是指令语义）')
+    assert.equal(buttons[index].action.click_limit, 1)
+    assert.match(buttons[index].action.data, new RegExp(`^ap:${decision}:ap:rm:1:`), '契约协议 ap:<decision>:<key>:<token>')
+    assert.deepEqual(buttons[index].action.permission.specify_user_ids, ['u_open'], '单聊锁定接收人')
+  }
   const again = await rig.inbound.sendApprovalCard({ chatId: 'u_open', title: 't', content: 'c', approvalKey: 'k', token: 't' })
   assert.ok(again !== null)
   assert.equal(rig.calls.at(-1).body.msg_seq, 2, '同目标 msg_seq 递增（服务端按 seq 去重）')
@@ -332,14 +345,14 @@ test('editResolved：补发审批结果文本（消息不可编辑）；无 chat
   await rig.inbound.stop()
 })
 
-test('notifyTargets：notifyUsers + notifyGroups 优先，缺省回落全局白名单；capabilities.buttons=false', async () => {
+test('notifyTargets：notifyUsers + notifyGroups 优先，缺省回落全局白名单；capabilities.buttons=true（v0.8.4 按钮化）', async () => {
   const rig = makeRig({ config: { notifyUsers: ['u1', 'u2'], notifyGroups: ['g1'] } })
   assert.deepEqual(rig.inbound.notifyTargets(), [
     { chatId: 'u1', userId: 'u1' },
     { chatId: 'u2', userId: 'u2' },
     { chatId: 'g1', userId: 'g1' },
   ])
-  assert.deepEqual(rig.inbound.capabilities, { buttons: false })
+  assert.deepEqual(rig.inbound.capabilities, { buttons: true })
   const fallback = makeRig({ config: { notifyUsers: [], notifyGroups: [], fallbackTargets: ['u_global'] } })
   assert.deepEqual(fallback.inbound.notifyTargets(), [{ chatId: 'u_global', userId: 'u_global' }])
   await rig.inbound.stop()
