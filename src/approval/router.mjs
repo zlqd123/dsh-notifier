@@ -187,7 +187,11 @@ export function registerApprovalHandler(deps) {
         if (alias !== undefined) merged.add(alias)
       }
       return [...merged]
-    } catch {
+    } catch (error) {
+      // P1-2 错误可见性（2026-08-20，Trae1，自上游 0.8.6 接力）：路由解析异常与
+      // 「空集」同样回落全局广播（fail-safe 投递语义不变），但异常路径原先零日志
+      // ——路由子系统坏了会无声地把审批卡广播到全渠道。
+      warn(`审批分流解析异常，回落全局广播（路由引擎报错: ${error instanceof Error ? error.message : String(error)}）`)
       return null
     }
   }
