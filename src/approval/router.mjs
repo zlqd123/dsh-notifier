@@ -8,6 +8,9 @@
 //  - 一次点击只授权一次操作：token 单次核销 + 账本状态机（首达采纳）
 //  - A listener never throws：整个 handler 包 try/catch，任何异常退回 next()
 //  - observe 模式只旁观：推完卡片立即 next()，桌面照常决定
+//
+// parallel 并行裁决：approvalConfig.parallel === true 时推卡后立即放行 next()，
+// 远程 bus.wait 与下游结果竞速、先答先算；缺省 false 为排他瀑布（等待期不询问桌面）。
 
 import { createEscalationChain } from './escalation.mjs'
 import { normalizeInbound } from '../inbound/_contract.mjs'
@@ -46,7 +49,9 @@ const DEFAULT_ESCALATION_STAGES = [
  *   每项实现统一契约（channel/notifyTargets/sendApprovalCard/editResolved/sendText，
  *   见 inbound/_contract.mjs）；telegram 旧形状（notifyChatIds/editResolved(chatId,messageId,text)）也接受
  * @param {{ mode?: 'observe'|'answer', timeoutMs?: number, numberedReply?: boolean,
+ *           parallel?: boolean,
  *           escalation?: { enabled?: boolean, stages?: Array<object> } }} [deps.approvalConfig]
+ *   parallel: true：推卡后立即放行 next() 与下游结果竞速、先答先算；缺省 false 排他瀑布。
  * @param {object} [deps.logger]
  * @param {number} [deps.counterStart=随机] - 审批 key 计数器起点。生产随机化（v0.6.4：
  *   重启后 counter 归零 + 同 callId 复现会让旧卡片 token 撞新审批的 key，在 tokenSecret
@@ -334,6 +339,59 @@ export function registerApprovalHandler(deps) {
 
       if (mode !== 'answer') {
         return next() // observe：只旁观，桌面照常决定
+      }
+
+      // —— parallel 并行分支：立即放行 next()，与远程 wait 竞速、先答先算 ——
+      // 桌面先行：abandon 撤销 waiter（迟到回复已决拒收）+ terminate 防悬挂 pending；
+      // 远程先行：直接返回裁决；远程窗口先关：改交还文案，继续等桌面。安全红线不变。
+      if (approvalConfig.parallel === true) {
+        const parallelStartedAt = Date.now()
+        escalation.start(key, (_key, stage) => {
+          notifier.notifyAll({
+            title: `${request?.toolName ?? '操作'} 仍在等待批准`,
+            content: `${stage.note ?? '仍在等待批准'}（已等待 ${Math.round((Date.now() - parallelStartedAt) / 1000)}s）。\n回复 1 批准 / 2 拒绝${cardChannelNames !== '' ? `，或点击 ${cardChannelNames} 卡片按钮` : ''}。`,
+            level: stage.level ?? 'timeSensitive',
+          }, channelTypes !== null ? { channelTypes } : {}).catch(() => {})
+        })
+        const desktopAsk = Promise.resolve().then(() => next())
+        desktopAsk.catch(() => {}) // 下游结果在竞速中消费；提前挂 catch 防未处理拒绝
+        const outcome = await new Promise((resolveRace) => {
+          let done = false
+          const finish = (value) => { if (!done) { done = true; resolveRace(value) } }
+          decisionPromise.then((decision) => {
+            if (done) return
+            if (decision !== null) return finish({ kind: 'remote', decision })
+            // 远程窗口关闭（超时或会话终止）：停升级链、改卡片文案，继续等桌面
+            escalation.stop(key)
+            if (ledger.get(key)?.decision === 'terminated') {
+              void markRemoteResolved(pushedTo, '⏹ 已终止：agent 会话已结束，审批取消').catch(() => {})
+            } else {
+              ledger.resolve(key, 'timeout')
+              void markRemoteResolved(pushedTo, '⏱ 手机端等待超时：请到桌面/Web 处理（手机按钮已失效）').catch(() => {})
+            }
+          })
+          desktopAsk.then(
+            (result) => finish({ kind: 'desktop', result }),
+            (error) => {
+              // 下游应答器抛错：按无裁决处理（undefined 透传），不吞日志
+              warn(`桌面/下游应答器异常: ${error instanceof Error ? error.message : String(error)}`)
+              finish({ kind: 'desktop', result: undefined })
+            },
+          )
+        })
+        escalation.stop(key)
+        if (outcome.kind === 'remote') {
+          ledger.resolve(key, outcome.decision.decision)
+          await markRemoteResolved(pushedTo, outcome.decision.decision === OUTCOME_ALLOWED ? '✅ 已远程批准（本次）' : '❌ 已远程拒绝')
+          warn(`${key} 并行裁决：${outcome.decision.decision}（via ${outcome.decision.via}；桌面询问已先行发出，迟到操作按已决忽略）`)
+          return outcome.decision.decision
+        }
+        // 桌面/下游先行：撤销远程 waiter（迟到回复→already-resolved），账本翻终态防悬挂 pending
+        try { bus.abandon?.(key, 'desktop-first') } catch { /* waiter 不存在亦无妨 */ }
+        try { ledger.terminate(key) } catch { /* 账本失败不致命 */ }
+        warn(`${key} 桌面/下游先行裁决，远程等待已撤销`)
+        await markRemoteResolved(pushedTo, '🖥️ 已在桌面处理（手机按钮已失效）')
+        return outcome.result
       }
 
       // 升级链与 wait 并行：每到一个 stage 再推一轮更高 level 提醒
