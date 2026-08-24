@@ -19,7 +19,7 @@
 
 import { createTokenManager, createRateGate } from '../adapters/_tokens.mjs'
 import { resolveNotifyTargets } from './target-guard.mjs'
-import { buildApprovalAction, parseApprovalAction } from './_contract.mjs'
+import { buildApprovalAction, parseApprovalAction, buildQuestionAction, parseQuestionAction } from './_contract.mjs'
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 const DEFAULT_API_BASE = 'https://api.sgroup.qq.com'
@@ -274,18 +274,37 @@ export function createQqInbound(options = {}) {
         })
         targetKinds.set(chatId, chatId === userId ? 'user' : 'group')
         const parsed = parseApprovalAction(buttonData)
-        if (parsed === null) return
-        const result = bus.accept({
+        if (parsed !== null) {
+          const result = bus.accept({
+            channel: 'qq',
+            userId,
+            chatId,
+            messageId: interactionId,
+            text: `[审批按钮:${parsed.decision}] ${parsed.approvalKey}`,
+            approvalAction: { decision: parsed.decision, approvalKey: parsed.approvalKey, token: parsed.token },
+          })
+          if (result?.reply !== undefined) {
+            postMessage(chatId, String(result.reply), interactionId).catch((error) => {
+              warn(`按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
+            })
+          }
+          return
+        }
+        // v0.8.x 提问按钮：aq:<qKey>:<optIdx|s|c>:<token>（选项下标 / s=跳过 / c=自定义
+        // 教学）。与审批按钮同一分发面、互斥前缀；非本插件按钮静默忽略。
+        const qParsed = parseQuestionAction(buttonData)
+        if (qParsed === null) return
+        const qResult = bus.accept({
           channel: 'qq',
           userId,
           chatId,
           messageId: interactionId,
-          text: `[审批按钮:${parsed.decision}] ${parsed.approvalKey}`,
-          approvalAction: { decision: parsed.decision, approvalKey: parsed.approvalKey, token: parsed.token },
+          text: `[提问按钮:${qParsed.optIdx}] ${qParsed.qKey}`,
+          questionAction: { qKey: qParsed.qKey, optIdx: qParsed.optIdx, token: qParsed.token },
         })
-        if (result?.reply !== undefined) {
-          postMessage(chatId, String(result.reply), interactionId).catch((error) => {
-            warn(`按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
+        if (qResult?.reply !== undefined) {
+          postMessage(chatId, String(qResult.reply), interactionId).catch((error) => {
+            warn(`提问按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
           })
         }
         return
@@ -519,6 +538,50 @@ export function createQqInbound(options = {}) {
         return messageId !== null ? { messageId } : null
       } catch (error) {
         warn(`审批通知发送失败: ${error instanceof Error ? error.message : String(error)}`)
+        return null
+      }
+    },
+
+    /** 推提问卡片（v0.8 sendQuestionCard 契约实现）：markdown 选项清单 + 每项一枚
+     *  回调按钮（aq:<qKey>:<idx>:<token>，P7 载荷不带选项文本）+ 尾行「跳过/自定义」。
+     *  多选场景点按钮=单选提交（组合选择走「1,3」编号文本）；自定义回答走「答：内容」
+     *  文本前缀（按钮只作教学）。失败抛错由 normalizeInbound 归一 null → 编号兜底。 */
+    async sendQuestionCard({ chatId, title, content, qKey, token, options, multiSelect }) {
+      const opts = Array.isArray(options) ? options.map((label) => String(label)) : []
+      if (opts.length === 0) return null
+      try {
+        const isUserTarget = targetKindOf(chatId) === 'user'
+        const actionButton = (id, label, visitedLabel, style, optIdx) => ({
+          id,
+          render_data: { label, visited_label: visitedLabel, style },
+          action: {
+            type: 1,
+            ...(isUserTarget ? { permission: { type: 2, specify_user_ids: [String(chatId)] } } : {}),
+            click_limit: 1,
+            data: buildQuestionAction(qKey, optIdx, token),
+          },
+        })
+        const rows = opts.slice(0, 5).map((label, idx) => ({
+          buttons: [actionButton(`q_opt_${idx}`, `${idx + 1}. ${label.slice(0, 12)}`, '已作答', 0, String(idx))],
+        }))
+        rows.push({
+          buttons: [
+            actionButton('q_skip', '⏭ 跳过', '已跳过', 2, 's'),
+            actionButton('q_custom', '✍️ 自定义', '见说明', 0, 'c'),
+          ],
+        })
+        const markdown = [
+          title,
+          content,
+          '',
+          ...opts.map((label, idx) => `${idx + 1}. ${label}`),
+          multiSelect === true ? '（多选题：点按钮=提交单选；组合选择请回复编号如 1,3）' : '',
+          '自定义回答：回复「答：<你的回答>」',
+        ].filter((line) => line !== '').join('\n')
+        const messageId = await postMarkdownWithKeyboard(chatId, markdown, { content: { rows } })
+        return messageId !== null ? { messageId } : null
+      } catch (error) {
+        warn(`提问卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)
         return null
       }
     },

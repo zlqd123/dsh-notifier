@@ -218,7 +218,13 @@ export function createQuestionBridge(deps) {
     // 编号文案只发卡片未送达的渠道（P4 文字路径兜底）：卡片已到手的用户不再收
     // 一条冗余的「回复编号」广播——选项卡是主交互，编号是无卡片/投递失败时的降级。
     const allTypes = Array.isArray(notifier?.channels) ? notifier.channels : []
-    const textTypes = allTypes.filter((type) => !deliveredTypes.has(type))
+    // 出站名经别名映射折算成入站名再比对送达集（qq-bot↔qq 同款异名问题：
+    // 卡片已送达 qq 入站时，出站 qq-bot 不应重复发编号话术）。无别名映射的
+    // 渠道折算到自身名（telegram 等出入站同名，天然命中）。
+    const textTypes = allTypes.filter((type) => {
+      const inboundName = OUTBOUND_TO_INBOUND_ALIAS[String(type)] ?? String(type)
+      return !deliveredTypes.has(inboundName)
+    })
     if (textTypes.length > 0) {
       await notifier.notifyAll({
         title,
@@ -321,14 +327,91 @@ export function createQuestionBridge(deps) {
   }
 
   /**
+   * 提问按钮回调（v0.8.x qq INTERACTION）：envelope.questionAction 由 qq-gw 从
+   * aq:<qKey>:<optIdx|s|c>:<token> 解析注入。数字下标=单选提交（多选组合走编号
+   * 文本「1,3」）；'s'=跳过本问题（立即交还桌面，answered=false，绝不代答）；
+   * 'c'=自定义回答教学回执。安全链路与飞书卡片回调同路径：decide() 做 vault
+   * 验签 + pushedTo 来源（channel+chatId）校验 + 首达采纳。
+   */
+  function handleCardAction(envelope) {
+    const action = envelope?.questionAction
+    if (action === undefined || action === null) return false
+    const qKey = String(action.qKey ?? '')
+    const optIdx = String(action.optIdx ?? '')
+    const sendFeedback = (message) => {
+      const inbound = interactiveEntries().find((entry) => entry.channel === envelope.channel)
+      if (inbound !== undefined) void inbound.sendText(envelope.chatId, message)
+    }
+    if (/^(s|skip)$/i.test(optIdx)) {
+      const row = ledger.get(qKey)
+      if (row === undefined || row.status !== 'pending') {
+        sendFeedback('该提问已回答或已过期')
+        return true
+      }
+      const verdict = bus.settle(qKey, { kind: 'aq-skip', idxs: [] }, `${envelope.channel}:button`, envelope.userId)
+      if (!verdict.ok) {
+        sendFeedback('该提问已被作答（首达采纳）')
+        return true
+      }
+      ledger.resolve(qKey, 'skipped', { via: `${envelope.channel}:button`, userId: String(envelope.userId) })
+      warn(`${qKey} 已跳过（via ${envelope.channel}:button）`)
+      sendFeedback('⏭ 已跳过该提问：交还桌面处理')
+      return true
+    }
+    if (/^(c|custom)$/i.test(optIdx)) {
+      sendFeedback('✍️ 自定义回答：直接回复「答：<你的回答>」，该消息将作为本题答案提交（不进对话路由）')
+      return true
+    }
+    if (!/^\d$/.test(optIdx)) {
+      sendFeedback('无效的选项按钮')
+      return true
+    }
+    const verdict = decide({
+      qKey,
+      optIdx,
+      token: String(action.token ?? ''),
+      via: `${envelope.channel}:button`,
+      userId: envelope.userId,
+      chatId: envelope.chatId,
+    })
+    if (verdict.ok === true) sendFeedback(`✅ 已作答：${(verdict.answers ?? []).join('、')}`)
+    else sendFeedback(verdict.message ?? '作答失败')
+    return true
+  }
+
+  /**
    * 编号回复兜底（P4）：白名单用户回复 '2' / '1,3'（中英文逗号均可）作答最近一条待决提问。
    * 发错了不作废——无效编号：消费该消息（不进对话路由）+ 回执提示 + 把选项重发一遍，
    * 问题保持待决，用户直接再答即可；有效作答后回执确认。
    * 消费语义与审批一致：返回 true = bus 停止扇出（不进对话路由）。
    * 注意：审批的编号处理器先注册（'1'/'2' 且有待决审批时审批优先消费）。
+   * v0.8.x 自定义回答：「答：内容」前缀 + 该渠道用户有待决提问 → 文本作为答案提交。
+   * 必须带前缀：裸文本永远进对话路由，绝不劫持普通聊天。
    */
   function handleNumberedReply(envelope) {
     const text = String(envelope.text ?? '').trim()
+    if (/^答[:：]/.test(text)) {
+      const pending = ledger.latestPendingFor(envelope.channel, envelope.userId)
+      if (pending === null) return false // 无待决提问：放行进对话路由
+      const answer = text.replace(/^答[:：]\s*/, '').trim()
+      const sendAnswerFeedback = (message) => {
+        const inbound = interactiveEntries().find((entry) => entry.channel === envelope.channel)
+        if (inbound !== undefined) void inbound.sendText(envelope.chatId, message)
+      }
+      if (answer === '') {
+        sendAnswerFeedback('✍️ 请在「答：」后面写上你的回答，例如：答：用方案 B')
+        return true
+      }
+      const verdict = bus.settle(pending.key, { kind: 'aq-text', idxs: [], text: answer }, `${envelope.channel}:text`, envelope.userId)
+      if (!verdict.ok) {
+        sendAnswerFeedback('该提问已被作答（首达采纳）')
+        return true
+      }
+      ledger.resolve(pending.key, 'answered', { answers: [answer], via: `${envelope.channel}:text`, userId: String(envelope.userId) })
+      warn(`${pending.key} 自定义作答：${answer.slice(0, 40)}（via ${envelope.channel}:text）`)
+      sendAnswerFeedback(`✅ 已作答（自定义）：${answer}`)
+      return true
+    }
     if (!/^\d{1,2}([,，]\d{1,2})*$/.test(text)) return false
     const nums = text.split(/[,，]/).map(Number)
     if (nums.length === 0) return false
@@ -365,16 +448,19 @@ export function createQuestionBridge(deps) {
     return true
   }
 
+  let disposeCardAction = null
   let disposeMessage = null
   let disposed = false
 
   /**
-   * 挂载编号回复处理器。必须在审批路由注册之后调用（bus.onMessage 插入序 =
-   * 消费优先级：审批 '1'/'2' 先于提问编号，避免歧义时提问抢走审批回复）。
+   * 挂载按钮回调 + 编号回复处理器。必须在审批路由注册之后调用（bus.onMessage 插入序 =
+   * 消费优先级：审批 '1'/'2' 先于提问编号，避免歧义时提问抢走审批回复）。按钮回调与
+   * 编号互不相干（questionAction 信封 vs 纯数字文本），先后无谓，同批挂载。
    */
   function attach() {
-    if (disposeMessage !== null || disposed) return
-    disposeMessage = bus.onMessage(handleNumberedReply)
+    if (disposed) return
+    if (disposeCardAction === null) disposeCardAction = bus.onMessage(handleCardAction)
+    if (disposeMessage === null) disposeMessage = bus.onMessage(handleNumberedReply)
   }
 
   /**
@@ -437,6 +523,20 @@ export function createQuestionBridge(deps) {
           allAnswered = false
           continue
         }
+        // 提问按钮「跳过」（v0.8.x）：绝不代答，立即交还桌面（与超时同语义、更快）
+        if (outcome?.decision?.kind === 'aq-skip') {
+          await markResolved(ledger.get(qKey)?.pushedTo ?? [], '⏭ 已跳过：交还桌面处理')
+          results.push({ question: String(question.question ?? ''), answered: false, reason: 'skipped-by-user' })
+          allAnswered = false
+          continue
+        }
+        // 自定义文本作答（「答：内容」前缀）：答案即用户输入的自由文本
+        if (outcome?.decision?.kind === 'aq-text') {
+          const customAnswer = String(outcome.decision.text ?? '')
+          await markResolved(ledger.get(qKey)?.pushedTo ?? [], `✅ 已作答（自定义）：${customAnswer}`)
+          results.push({ question: String(question.question ?? ''), answered: true, answers: [customAnswer], via: outcome.via })
+          continue
+        }
       } catch (error) {
         warn(`提问推送/等待异常（交还桌面语义）: ${error instanceof Error ? error.message : String(error)}`)
         try { escalation.stop(qKey) } catch { /* 清理不致命 */ }
@@ -469,7 +569,9 @@ export function createQuestionBridge(deps) {
 
   function dispose() {
     disposed = true
+    try { disposeCardAction?.() } catch { /* 反注册失败不致命 */ }
     try { disposeMessage?.() } catch { /* 反注册失败不致命 */ }
+    disposeCardAction = null
     disposeMessage = null
     escalation.dispose()
   }
