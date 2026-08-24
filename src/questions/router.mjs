@@ -95,6 +95,10 @@ export function createQuestionBridge(deps) {
     logger,
   })
 
+  // 武装模式登记表：点「✍️ 自定义」后 (channel:userId) → qKey，该用户下一条消息
+  // 即作为对应提问的答案。进程内存态（不落库）——重启即清空，安全侧倾斜。
+  const armedCustom = new Map()
+
   const ledger = {
     add(key, row) {
       store.set(key, { ...row, status: 'pending', createdAt: Date.now() })
@@ -355,11 +359,17 @@ export function createQuestionBridge(deps) {
       }
       ledger.resolve(qKey, 'skipped', { via: `${envelope.channel}:button`, userId: String(envelope.userId) })
       warn(`${qKey} 已跳过（via ${envelope.channel}:button）`)
-      sendFeedback('⏭ 已跳过该提问：交还桌面处理')
+      // 成功路径不在此回执：askQuestions 收尾的 markResolved 会广播唯一一条
+      // 「⏭ 已跳过：交还桌面处理」，这里再发就是同事件双播报（2026-08-24 实测）。
       return true
     }
     if (/^(c|custom)$/i.test(optIdx)) {
-      sendFeedback('✍️ 自定义回答：直接回复「答：<你的回答>」，该消息将作为本题答案提交（不进对话路由）')
+      // 武装模式：点「✍️ 自定义」= 该用户在此渠道的下一条消息直接成为本题答案
+      // （2026-08-24 实测反馈：要求先打「答：」前缀反直觉——用户点了按钮就期望
+      // 立刻能说话）。武装只对 (channel+userId) 生效、随问题终态自动失效；
+      // 免按钮场景仍可用「答：内容」前缀直达。
+      armedCustom.set(`${envelope.channel}:${envelope.userId}`, qKey)
+      sendFeedback('✍️ 请直接输入你的回答：下一条消息将作为本题答案提交')
       return true
     }
     if (!/^\d$/.test(optIdx)) {
@@ -374,8 +384,9 @@ export function createQuestionBridge(deps) {
       userId: envelope.userId,
       chatId: envelope.chatId,
     })
-    if (verdict.ok === true) sendFeedback(`✅ 已作答：${(verdict.answers ?? []).join('、')}`)
-    else sendFeedback(verdict.message ?? '作答失败')
+    // 成功路径不在此回执：askQuestions 收尾的 markResolved 会广播唯一一条
+    // 「[审批结果] ✅ 已作答：…（来源 qq:button）」（同事件双播报修复）。
+    if (verdict.ok !== true) sendFeedback(verdict.message ?? '作答失败')
     return true
   }
 
@@ -390,6 +401,31 @@ export function createQuestionBridge(deps) {
    */
   function handleNumberedReply(envelope) {
     const text = String(envelope.text ?? '').trim()
+    // 武装模式消费（优先于一切文本规则）：点过「✍️ 自定义」的用户，下一条消息
+    // 无论内容（含纯数字如「111」）都作为本题答案提交。问题已终态则自动解除武装
+    // 并放行消息。成功不即时回执（markResolved 收尾播报唯一化）。
+    const armedKey = `${envelope.channel}:${envelope.userId}`
+    if (armedCustom.has(armedKey)) {
+      const qKey = armedCustom.get(armedKey)
+      const row = ledger.get(qKey)
+      const disarm = () => armedCustom.delete(armedKey)
+      if (row === undefined || row.status !== 'pending') {
+        disarm()
+        return false // 问题已终态：解除武装，消息照常走后续处理
+      }
+      const answer = text.replace(/^答[:：]\s*/, '').trim()
+      disarm() // 一次性消费：无论成败都不再拦截下一条
+      if (answer === '') return true // 空消息只解除武装，静默吞掉
+      const verdict = bus.settle(qKey, { kind: 'aq-text', idxs: [], text: answer }, `${envelope.channel}:text`, envelope.userId)
+      if (!verdict.ok) {
+        const inbound = interactiveEntries().find((entry) => entry.channel === envelope.channel)
+        if (inbound !== undefined) void inbound.sendText(envelope.chatId, '该提问已被作答（首达采纳）')
+        return true
+      }
+      ledger.resolve(qKey, 'answered', { answers: [answer], via: `${envelope.channel}:text`, userId: String(envelope.userId) })
+      warn(`${qKey} 自定义作答：${answer.slice(0, 40)}（via ${envelope.channel}:text）`)
+      return true
+    }
     if (/^答[:：]/.test(text)) {
       const pending = ledger.latestPendingFor(envelope.channel, envelope.userId)
       if (pending === null) return false // 无待决提问：放行进对话路由
@@ -409,7 +445,7 @@ export function createQuestionBridge(deps) {
       }
       ledger.resolve(pending.key, 'answered', { answers: [answer], via: `${envelope.channel}:text`, userId: String(envelope.userId) })
       warn(`${pending.key} 自定义作答：${answer.slice(0, 40)}（via ${envelope.channel}:text）`)
-      sendAnswerFeedback(`✅ 已作答（自定义）：${answer}`)
+      // 成功路径不在此回执：markResolved 收尾播报唯一化（同双播报修复）
       return true
     }
     if (!/^\d{1,2}([,，]\d{1,2})*$/.test(text)) return false

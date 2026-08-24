@@ -82,7 +82,7 @@ test('卡片推送：sendQuestionCard 收到契约参数并落账 pushedTo；不
   assert.deepEqual(outcome.results[0].answers, ['方案 B'])
 })
 
-test('按钮作答：数字下标经验签+来源校验裁决，回执确认', async () => {
+test('按钮作答：数字下标经验签+来源校验裁决，无即时回执（收尾播报唯一化）', async () => {
   const rig = makeRig()
   const pending = rig.ask()
   await sleep(30)
@@ -91,7 +91,7 @@ test('按钮作答：数字下标经验签+来源校验裁决，回执确认', a
   assert.equal(outcome.answered, true)
   assert.deepEqual(outcome.results[0].answers, ['方案 A'])
   assert.equal(outcome.results[0].via, 'qq:button')
-  assert.ok(rig.texts.some((t) => /✅ 已作答：方案 A/.test(t.text)))
+  assert.ok(!rig.texts.some((t) => /✅ 已作答/.test(t.text))) // 防双播报
 })
 
 test('跳过按钮：立即交还桌面（answered=false, skipped-by-user），绝不代答', async () => {
@@ -103,22 +103,38 @@ test('跳过按钮：立即交还桌面（answered=false, skipped-by-user），�
   assert.equal(outcome.answered, false)
   assert.equal(outcome.results[0].reason, 'skipped-by-user')
   assert.equal(rig.store.get(rig.cards[0].qKey).decision, 'skipped')
-  assert.ok(rig.texts.some((t) => /⏭ 已跳过/.test(t.text)))
+  assert.ok(!rig.texts.some((t) => /⏭ 已跳过/.test(t.text))) // 无即时回执：收尾播报唯一化
 })
 
-test('自定义教学按钮：问题保持待决，回执教「答：」前缀', async () => {
+test('自定义武装模式：点「✍️ 自定义」后下一条消息直接成为答案（含纯数字）', async () => {
   const rig = makeRig()
   const pending = rig.ask()
   await sleep(30)
   rig.clickButton({ qKey: rig.cards[0].qKey, optIdx: 'c', token: rig.cards[0].token })
   await sleep(10)
-  assert.ok(rig.texts.some((t) => /✍️ 自定义回答/.test(t.text)))
+  assert.ok(rig.texts.some((t) => /请直接输入你的回答/.test(t.text)))
   assert.equal(rig.store.get(rig.cards[0].qKey).status, 'pending') // 未被消费
-  // 教学之后按「答：」提交自由文本 → 成为答案
-  rig.bus.accept({ channel: 'qq', userId: OPENID_A, chatId: OPENID_A, messageId: 'm-custom', text: '答：用方案 B，理由如下' })
+  // 复现实测场景：用户点了自定义后输入「111」→ 应作为自由文本答案被捕获
+  rig.bus.accept({ channel: 'qq', userId: OPENID_A, chatId: OPENID_A, messageId: 'm-arm1', text: '111' })
   const outcome = await pending
   assert.equal(outcome.answered, true)
-  assert.deepEqual(outcome.results[0].answers, ['用方案 B，理由如下'])
+  assert.deepEqual(outcome.results[0].answers, ['111'])
+})
+
+test('武装一次性：消费一条后自动解除，后续消息回归普通聊天', async () => {
+  const rig = makeRig({ timeoutMs: 600 })
+  const pending = rig.ask()
+  await sleep(30)
+  rig.clickButton({ qKey: rig.cards[0].qKey, optIdx: 'c', token: rig.cards[0].token })
+  await sleep(10)
+  rig.bus.accept({ channel: 'qq', userId: OPENID_A, chatId: OPENID_A, messageId: 'm-a1', text: '第一次回答' })
+  const outcome = await pending
+  assert.deepEqual(outcome.results[0].answers, ['第一次回答'])
+  // 武装已解除：后续消息不再被提问桥消费
+  const textsBefore = rig.texts.length
+  rig.bus.accept({ channel: 'qq', userId: OPENID_A, chatId: OPENID_A, messageId: 'm-a2', text: '随便聊聊' })
+  await sleep(10)
+  assert.equal(rig.texts.length, textsBefore) // 无回执 = 未被消费
 })
 
 test('「答：」前缀自由文本：直接作为答案提交（无需先点教学按钮）', async () => {
