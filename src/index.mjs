@@ -40,7 +40,9 @@ import { createScanHandlers } from './admin/scan.mjs'
 import { runChannelTest } from './health.mjs'
 
 export const name = 'dsh-notifier'
-export const inject = ['tools', 'agents']
+// 2026-08-25 修：提问桥桌面腿访问 ctx.userQuestions（宿主服务，apiproxy 注册 provider），
+// cordis rc.6 要求插件静态声明后方可访问——缺声明即抛 cannot get property without inject。
+export const inject = ['tools', 'agents', 'userQuestions']
 
 /** 返回已解析配置（供测试与其它插件复用）。 */
 export function apply(ctx, config = {}) {
@@ -736,11 +738,12 @@ export function apply(ctx, config = {}) {
         const disposeAskTool = registerAskUserTool(ctx, questionsBridge, {
           rateLimitPerMinute: resolved.questions.rateLimitPerMinute,
           defaultTimeoutMs: resolved.questions.timeoutMs,
+          parallel: resolved.questions.parallel,
         })
         if (disposeAskTool !== null) disposers.push(disposeAskTool)
         questionsBridge.attach()
         disposers.push(() => questionsBridge.dispose())
-        warn(`远程提问已启用：ask_user 工具（限流 ${resolved.questions.rateLimitPerMinute} 次/分钟，超时 ${Math.round(resolved.questions.timeoutMs / 1000)}s 不代答）；飞书/Telegram 单选选项卡 + 全渠道编号兜底`)
+        warn(`远程提问已启用：ask_user 工具（限流 ${resolved.questions.rateLimitPerMinute} 次/分钟，超时 ${Math.round(resolved.questions.timeoutMs / 1000)}s 不代答）${resolved.questions.parallel ? '；双端并行——桌面弹窗与手机卡片同出、先答先算' : ''}；飞书/Telegram 单选选项卡 + 全渠道编号兜底`)
       } catch (error) {
         warn(`questions 桥装配失败，已跳过（其余能力不受影响）: ${error instanceof Error ? error.message : String(error)}`)
       }

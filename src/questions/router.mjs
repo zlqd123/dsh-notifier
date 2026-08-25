@@ -99,6 +99,12 @@ export function createQuestionBridge(deps) {
   // 即作为对应提问的答案。进程内存态（不落库）——重启即清空，安全侧倾斜。
   const armedCustom = new Map()
 
+  // 双端并行（2026-08-24）：当前批次仍待决的 qKey 集合 + 「桌面已抢先提交」旗标。
+  // 桌面（ctx.userQuestions 弹窗）先答 → 工具层调 abortActiveByDesktop() 终结远端
+  // 待决卡；askQuestions 循环头见旗标即不再发后续问题（桌面一次答完整批）。
+  let activeWaitKeys = new Set()
+  let desktopWonFirst = false
+
   const ledger = {
     add(key, row) {
       store.set(key, { ...row, status: 'pending', createdAt: Date.now() })
@@ -518,7 +524,14 @@ export function createQuestionBridge(deps) {
         allAnswered = false
         continue
       }
+      // 双端并行：桌面已抢先提交整批答案——后续问题不再外发，直接记「已在别处作答」
+      if (desktopWonFirst) {
+        results.push({ question: String(question?.question ?? ''), answered: false, reason: 'answered-elsewhere' })
+        allAnswered = false
+        continue
+      }
       const qKey = `${KEY_PREFIX}${randomBytes(4).toString('hex')}`
+      activeWaitKeys.add(qKey)
       let outcome = null
       try {
         const token = vault.mint(qKey)
@@ -563,6 +576,14 @@ export function createQuestionBridge(deps) {
         if (outcome?.decision?.kind === 'aq-skip') {
           await markResolved(ledger.get(qKey)?.pushedTo ?? [], '⏭ 已跳过：交还桌面处理')
           results.push({ question: String(question.question ?? ''), answered: false, reason: 'skipped-by-user' })
+          allAnswered = false
+          continue
+        }
+        // 双端并行：桌面/Web 抢先作答，本卡终结（工具层改用桌面答案组装结果）
+        if (outcome?.decision?.kind === 'aq-abort') {
+          ledger.resolve(qKey, 'answered-elsewhere', { via: 'web', userId: '(desktop)' })
+          await markResolved(ledger.get(qKey)?.pushedTo ?? [], '🖥️ 已在桌面/Web 作答，此卡已失效')
+          results.push({ question: String(question.question ?? ''), answered: false, reason: 'answered-elsewhere' })
           allAnswered = false
           continue
         }
@@ -612,7 +633,23 @@ export function createQuestionBridge(deps) {
     escalation.dispose()
   }
 
-  return { askQuestions, decide, decideTrusted, attach, dispose }
+  /** 双端并行：桌面/Web 已提交作答——终结本批次所有仍待决的远端提问（waiter 唤醒、
+   *  卡片终态化由 aq-abort 分支收尾）。旗标置位后 askQuestions 不再外发后续问题。 */
+  function abortActiveByDesktop() {
+    if (disposed) return
+    desktopWonFirst = true
+    const keys = [...activeWaitKeys]
+    activeWaitKeys = new Set()
+    for (const key of keys) {
+      try {
+        const row = ledger.get(key)
+        if (row === undefined || row.status !== 'pending') continue
+        bus.settle(key, { kind: 'aq-abort', idxs: [] }, 'web', '(desktop)')
+      } catch { /* 单键终结失败不拖垮其余 */ }
+    }
+  }
+
+  return { askQuestions, decide, decideTrusted, attach, dispose, abortActiveByDesktop }
 }
 
 /** 校验并归一 ask_user 工具参数；违规返回 { ok:false, reason }。 */
@@ -650,11 +687,33 @@ export function validateAskArgs(rawArgs, { minTimeoutMs = 30_000, maxTimeoutMs =
   return { ok: true, questions, timeoutMs, context }
 }
 
+/** 把宿主原生应答 {answers:[{id,selected[],custom?}]} 映射为插件结果形状。
+ *  custom 优先（桌面自由输入），其次 selected 标签；两者皆空 = 桌面上跳过。 */
+function mapDesktopAnswer(answer, questions) {
+  const rows = Array.isArray(answer?.answers) ? answer.answers : []
+  const results = []
+  let allAnswered = true
+  questions.forEach((question, index) => {
+    const item = rows.find((row) => row?.id === `q${index + 1}`) ?? rows[index] ?? null
+    const custom = typeof item?.custom === 'string' ? item.custom.trim() : ''
+    const labels = Array.isArray(item?.selected) ? item.selected.filter((label) => label !== '') : []
+    if (custom !== '') {
+      results.push({ question: question.question, answered: true, answers: [custom], via: 'web' })
+    } else if (labels.length > 0) {
+      results.push({ question: question.question, answered: true, answers: labels, via: 'web' })
+    } else {
+      results.push({ question: question.question, answered: false, reason: 'skipped-on-desktop' })
+      allAnswered = false
+    }
+  })
+  return { ok: true, answered: allAnswered, results, via: 'web', dualEnd: true }
+}
+
 /**
  * 注册 ask_user 工具（v0.8 远程提问）。
  * @param ctx - cordis 上下文（ctx.tools；宿主没有 tools 服务时静默跳过）
  * @param {ReturnType<typeof createQuestionBridge>} bridge
- * @param {{ rateLimitPerMinute?: number, defaultTimeoutMs?: number }} [options]
+ * @param {{ rateLimitPerMinute?: number, defaultTimeoutMs?: number, parallel?: boolean }} [options]
  */
 export function registerAskUserTool(ctx, bridge, options = {}) {
   if (ctx?.tools?.register === undefined) {
@@ -664,14 +723,14 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
   const limiter = createRateLimiter({ limitPerMinute: options.rateLimitPerMinute ?? 6 })
   return ctx.tools.register({
     name: 'ask_user',
-    description: '向用户提出选择题并等待作答（推送到用户手机：飞书选项卡片 / Telegram 按钮 / 其他渠道回复编号）。适合方案抉择、环境选择等需要用户拍板的分叉决策；用户装了 dsh-notifier 手机桥接时优先用本工具而不是 ask_user_question。超时不会代答——用户未作答时返回 answered=false，请改用桌面确认或调整方案继续。',
+    description: '向用户提出选择题并等待作答。双端并行：桌面 Web 弹窗与手机卡片同时出现，先答先算（与审批并行裁决同构）；远端超时未答而弹窗仍开时继续等桌面。适合方案抉择、环境选择等需要用户拍板的分叉决策；用户装了 dsh-notifier 手机桥接时优先用本工具而不是 ask_user_question。超时不会代答。',
     parameters: compileParameters({
       questions: {
         type: 'array',
         required: true,
         description: '1-4 个问题，每项 { question: 问题正文, options: [{ label: 选项 }](2-5 项), multiSelect?: 是否多选（默认 false） }',
       },
-      timeoutMs: { type: 'number', description: '作答时限毫秒（默认 300000，范围 30s-30min）；超时不代答' },
+      timeoutMs: { type: 'number', description: '作答时限毫秒（默认 300000，范围 30s-30min）；远端超时不代答，桌面弹窗仍开则继续等待' },
       context: { type: 'string', description: '为什么问（卡片引言，可选，300 字内）' },
     }),
     output: {
@@ -709,10 +768,70 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
       if (!validated.ok) {
         return { ok: false, answered: false, results: [], reason: validated.reason }
       }
+      // —— 双端并行（与审批 parallel 同构）：工具执行即同时弹桌面 Web 弹窗 + 推远端
+      // 卡片，先答先算。宿主没有 userQuestions 服务或 parallel 关闭时回落单端瀑布。
+      // 时序语义：
+      //   桌面先提交 → 终结远端待决卡，整批改用桌面答案；
+      //   远端全答完 → abort 弹窗，用远端结果；
+      //   远端超时/跳过而桌面仍开 → 继续等桌面（「远程窗口先关，继续等桌面」）；
+      //   桌面被用户关掉/服务不可用 → 回落远端结论，行为与单端一致。
+      // 2026-08-25 修：cordis 对插件内未声明注入的服务属性访问直接抛错（rc.6 拦截），
+      // 可选链救不了属性读取本身。已在插件级 inject 声明 userQuestions；此处再兜一层
+      // try/catch——服务缺失/作用域异常时回落单端瀑布，绝不弄崩工具。
+      let nativeAsk = null
       try {
-        return await bridge.askQuestions(validated, execContext)
+        nativeAsk = ctx?.userQuestions?.ask ?? null
+      } catch {
+        nativeAsk = null
+      }
+      if (options.parallel !== true || typeof nativeAsk !== 'function') {
+        try {
+          return await bridge.askQuestions(validated, execContext)
+        } catch (error) {
+          return { ok: false, answered: false, results: [], reason: error instanceof Error ? error.message : String(error) }
+        }
+      }
+      const desktopQuestions = validated.questions.map((question, index) => ({
+        id: `q${index + 1}`, // 原生契约要求稳定 id，应答按 id 回显
+        question: String(question.question ?? ''),
+        ...(Array.isArray(question.options) ? { options: question.options } : {}),
+        multiSelect: question.multiSelect === true,
+      }))
+      const controller = new AbortController()
+      let desktopWin = null // 桌面先提交时回填 { answer }
+      const desktopSettled = Promise.resolve().then(() => nativeAsk.call(ctx.userQuestions, {
+        questions: desktopQuestions,
+        ...(execContext?.agent !== undefined ? { agent: execContext.agent } : {}),
+        signal: controller.signal,
+      })).then(
+        (answer) => {
+          desktopWin = { answer }
+          try { bridge.abortActiveByDesktop() } catch { /* 单键终结失败不影响取答 */ }
+          return 'won'
+        },
+        () => 'lost', // 用户关掉弹窗 / 无 agent 会话 / 服务校验拒绝：远端线照旧
+      )
+      desktopSettled.catch(() => {}) // 竞速败方的结果已被消费，防未处理拒绝
+      try {
+        const remoteOutcome = await bridge.askQuestions(validated, execContext)
+        if (desktopWin !== null) {
+          return mapDesktopAnswer(desktopWin.answer, validated.questions)
+        }
+        if (remoteOutcome.answered === true) {
+          controller.abort() // 远端全答完：撤掉还没人理的桌面弹窗
+          // 收尸等待加宽限界：正常提供方（apiproxy）abort 即拒绝，此处只等它落定；
+          // 异常提供方永不落定也不能拖住工具返回（结果已定）。
+          await Promise.race([desktopSettled, new Promise((resolve) => setTimeout(resolve, 2000))])
+          return remoteOutcome
+        }
+        // 远端没答全（超时/跳过/终止）：远程窗口先关，继续等桌面兜底
+        if (await desktopSettled === 'won') {
+          return mapDesktopAnswer(desktopWin.answer, validated.questions)
+        }
+        return remoteOutcome
       } catch (error) {
-        return { ok: false, answered: false, results: [], reason: error instanceof Error ? error.message : String(error) }
+        controller.abort()
+        throw error
       }
     },
   })

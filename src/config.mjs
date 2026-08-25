@@ -268,6 +268,9 @@ export function resolveConfig(config = {}) {
   const rawQuestions = (raw.questions !== null && typeof raw.questions === 'object') ? raw.questions : {}
   const questions = {
     enabled: rawQuestions.enabled !== false,
+    // 双端并行（2026-08-24）：工具执行即同时弹桌面 Web 弹窗 + 推远端卡片，先答先算，
+    // 与审批 parallel 同构。缺省开启；parallel:false 回落单端瀑布（旧行为）。
+    parallel: rawQuestions.parallel !== false,
     timeoutMs: typeof rawQuestions.timeoutMs === 'number' && Number.isFinite(rawQuestions.timeoutMs) && rawQuestions.timeoutMs > 0
       ? Math.trunc(rawQuestions.timeoutMs)
       : 300_000,
