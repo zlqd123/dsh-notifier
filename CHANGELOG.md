@@ -3,6 +3,36 @@
 本副本基于 `dsh-notifier` 0.13.1（MIT）裁剪。上游完整变更史见
 <https://github.com/THEWOLFWALKER/dsh-notifier/blob/main/CHANGELOG.md>。
 
+## [0.13.1-qq.10]
+
+会话标题取真实值：改从 `session/title` 事件折叠。
+
+### 修复
+
+上一版（qq.9）仍拿不到真实标题——`ctx.sessionTitle.get()` 在插件侧取不到，
+而 `session.header.title` 这个回落字段**实际不存在**，所以只有测试桩里硬编码时才"成功"。
+
+- **改为自行折叠会话日志**：取 `session.snapshotEvents()` 中**最后一条 `session/title`
+  事件**的 `data.title`。这正是 DSH 标题服务内部的实现
+  （`foldSessionTitle(session.snapshotEvents())`），但**不依赖服务注入**，
+  宿主只要有会话日志就能拿到。本机实测正确取到当前会话标题 `gate`。
+- 三级降级：标题服务 → `snapshotEvents` 折叠 → `header.title`；全失败则该行整段不加
+  （不造假「(无标题)」，也不污染正文）。
+- 标题清洗改为按码点过滤控制字符（原正则转义写法在多次落盘后易被误伤），
+  多行标题压成单行。
+
+### 验证
+
+| 场景 | 结果 |
+|---|---|
+| 仅有 `session/title` 事件（无服务注入） | 取到 `gate` ✔ |
+| 无 title 事件 / `snapshotEvents` 抛错 / 无该方法 | 保持原正文 ✔ |
+| 标题含换行 | 压成 `第一行 第二行` ✔ |
+| 多次改名 | 取最后一条（`新标题`）✔ |
+| 标题为空串 | 保持原正文 ✔ |
+
+- 真实投递经网关验证正文首行为会话标题。
+
 ## [0.13.1-qq.9]
 
 会话标题取不到（inject 用法错误）+ 位置修正。

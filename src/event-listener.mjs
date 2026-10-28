@@ -455,23 +455,55 @@ export function createEventListener(ctx, notifier, resolvedConfig, wiring = {}) 
   })
 
   /**
-   * 取会话标题（用于通知正文第二行）。多来源降级，任一失败都只是少一行标题：
-   *   1. `ctx.sessionTitle.get(session)` — DSH 原生会话标题服务（用户命名或自动生成）
-   *   2. `session.header.title` — 旧宿主/测试桩上可能的直挂字段
-   *   3. 空串 — 不写这一行（宁缺勿造假标题）
+   * 取会话标题（用于通知正文）。多来源降级，任一失败都只是少一行标题：
+   *   1. `ctx.sessionTitle.get(session)` — DSH 原生会话标题服务（缺注入时取不到）
+   *   2. **自行折叠 `session.snapshotEvents()` 里最后一条 `session/title` 事件** ——
+   *      这正是标题服务内部的实现（`foldSessionTitle(session.snapshotEvents())`），
+   *      不依赖服务注入；宿主只要有会话日志就能拿到（本机实测取到 "gate"）。
+   *   3. `session.header.title` — 旧宿主/测试桩上可能的直挂字段
+   *   4. 空串 — 该行整段不加（宁缺勿造假标题）
    * @returns {string} 已去控制字符的单行标题；取不到为空串
    */
   const sessionTitleOf = (session) => {
     if (session === null || session === undefined) return ''
-    const pick = (value) => (typeof value === 'string' ? value.replace(/[\r\n\t]+/g, ' ').trim() : '')
-    // 防御式探测：ctx.get(name, false) 在服务不存在时返回 undefined（不抛错），
-    // 不用 inject 声明——那会让缺该服务的宿主拒绝加载整个插件。
+    // 控制字符/换行压成单空格：用码点判断，避免正则转义在不同写入路径下被误解
+    const pick = (value) => {
+      if (typeof value !== 'string') return ''
+      let out = ''
+      for (const ch of value) {
+        const code = ch.codePointAt(0)
+        out += (code < 0x20 || code === 0x7f) ? ' ' : ch
+      }
+      // 连续空格压成一个，再去首尾空白
+      let squeezed = ''
+      let prevSpace = false
+      for (const ch of out) {
+        const isSpace = ch === ' '
+        if (isSpace && prevSpace) continue
+        squeezed += ch
+        prevSpace = isSpace
+      }
+      return squeezed.trim()
+    }
+    // 1) 标题服务（防御式：ctx.get(name, false) 服务不存在时返回 undefined，不抛错）
     try {
       const service = typeof ctx?.get === 'function' ? ctx.get('sessionTitle', false) : undefined
-      const snapshot = service?.get?.(session)
-      const fromService = pick(snapshot?.title)
+      const fromService = pick(service?.get?.(session)?.title)
       if (fromService !== '') return fromService
-    } catch { /* 服务缺失/会话已释放：降级到下一个来源 */ }
+    } catch { /* 服务缺失/会话已释放：降级 */ }
+    // 2) 自行折叠 session/title 事件（与标题服务同源，但不依赖注入）
+    try {
+      const events = typeof session?.snapshotEvents === 'function' ? session.snapshotEvents() : null
+      if (Array.isArray(events)) {
+        for (let i = events.length - 1; i >= 0; i -= 1) {
+          const event = events[i]
+          if (event?.type !== 'session/title') continue
+          // 最后一条 title 事件即当前标题；其标题为空则视为无标题（不再向前找旧值）
+          return pick(event?.data?.title)
+        }
+      }
+    } catch { /* 会话日志不可读：降级 */ }
+    // 3) 旧形状回落
     try {
       const fromHeader = pick(session?.header?.title)
       if (fromHeader !== '') return fromHeader
