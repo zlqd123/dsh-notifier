@@ -42,10 +42,13 @@ const QQ_MARKDOWN_MAX_CODEPOINTS = 3000
  *  超限时平台静默丢弃（无错误码、无回执）——本侧不硬阻塞投递（硬阻塞把「可能仍送达」
  *  变成「必然不送达」），仅 warn 出声让丢弃可见。主动消息（无 msg_id）不受此配额约束。 */
 const QQ_PASSIVE_REPLY_QUOTA = { user: 4, group: 5 }
-/** #26 对齐腾讯 dsh-qqbot 参考实现（`src/features/button-utils.ts` 的 BUTTON_LABEL_MAX=10）：
- *  QQ keyboard 按钮 label 上限 ≤10 码点。按码点截断（不用 .length 的 UTF-16 语义——
- *  emoji/星体字符按码元切会把代理项劈成两半，G-22 同根），超长取前 9 码点补省略号。 */
-const QQ_BUTTON_LABEL_MAX_CODEPOINTS = 10
+/** QQ keyboard 按钮 label 上限 = **15 码点**（实测值，非参考实现取值）。
+ *  原实现沿用腾讯 dsh-qqbot 参考实现的 BUTTON_LABEL_MAX=10，比平台真实上限保守 5 个字符，
+ *  导致 11~15 字的选项被提前截成「1. 一次性验证…」。2026-10-28 实测：向平台直接发送
+ *  10/15/20/30 字的 label，15 字完整显示、20 字起被省略号截断，故取 15。
+ *  按码点截断（不用 .length 的 UTF-16 语义——emoji/星体字符按码元切会把代理项劈成
+ *  两半，G-22 同根），超长取前 14 码点补省略号。 */
+const QQ_BUTTON_LABEL_MAX_CODEPOINTS = 15
 
 // WS op codes（QQ 网关协议）
 const OP_DISPATCH = 0
@@ -833,9 +836,12 @@ export function createQqInbound(options = {}) {
       try {
         const isUserTarget = targetKindOf(chatId) === 'user'
         if (!isUserTarget) return null // 群聊不展示可操作提问卡，避免成员间信息/权限泄漏
+        // 按钮 label 只有 15 码点：**不再加「1. 」序号前缀**，把额度全部留给选项正文。
+        // 编号由卡片正文的 `**1.**` 清单承担（正文无长度限制），按钮与正文靠顺序对应；
+        // 点击回调仍按 optIdx 精确结算，不依赖按钮上的序号。
         const buttons = options.slice(0, 5).map((label, index) => ({
           id: `q_${index}`,
-          render_data: { label: clampButtonLabel(`${index + 1}. ${String(label)}`), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+          render_data: { label: clampButtonLabel(String(label)), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
           action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, String(index), token) },
         }))
         buttons.push({ id: 'q_custom', render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 }, action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) } })
