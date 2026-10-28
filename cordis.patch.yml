@@ -1,14 +1,23 @@
-# dsh-notifier bundle patch: inserts the plugin row into the profile roster.
-# Install with `dsh plugin --profile <name> add file:/path/to/dsh-notifier`;
+# dsh-notifier-gate bundle patch: inserts the plugin row into the profile roster.
+# Install with `dsh plugin --profile <name> add file:/path/to/dsh-notifier-gate`;
 # the patch layer is applied through the loader on boot.
 #
-# 空配置随插件附带：channels 为空时插件只订阅不动作（绝不弄崩启动），
-# 在 profile 的 cordis.patch.yml 里覆盖本行 config.channels 即可配置渠道。
+# id / name 必须与 package.json 的包名一致：loader 按 name 作为模块 specifier 去
+# resolve，写成不存在的包名会让整条 bundle 在启动时被跳过（插件「启动时没能加载」）。
+#
+# 空配置随插件附带：channels 为空时插件只订阅不动作（绝不弄崩启动）。
+# 本插件的配置**唯一来源就是自己的配置行**（`- id: dsh-notifier-gate` 的 config）：
+# 不读取、也不借用原 dsh-notifier 插件的任何配置或状态。要填凭证请在 profile 的
+# cordis.patch.yml 里写 `- id: dsh-notifier-gate` 加 config（整块替换本行 config）。
 - insert:
-    - id: dsh-notifier
-      name: 'dsh-notifier'
+    - id: dsh-notifier-gate
+      name: 'dsh-notifier-gate'
       config:
         enabled: true
         debounceMs: 10000
         summaryMaxChars: 500
         channels: []
+        # 管理台默认关：需要时在 profile patch 里覆盖 admin.enabled: true
+        # （端口须避开 winnat 保留段）。
+        admin:
+          enabled: false

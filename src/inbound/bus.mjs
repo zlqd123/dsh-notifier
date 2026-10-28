@@ -15,11 +15,37 @@
 //  - 注册面命令（/whoami /pair /unpair + 引导态 /help）在业务扇出前拦截并消费。
 
 import { createCommandHandler, getChannelName, parseCommand } from './commands.mjs'
+import { createLog } from '../log.mjs'
+import { stringsOf } from '../strings.mjs'
+import { setDurable } from './store.mjs'
 
 const DEFAULT_DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000
+/** G-46：合成 messageId（内容哈希兜底键）短去重窗——只兜平台 HTTP 重投（秒级），
+ *  绝不能像平台原生 msgId 一样扛 24h：合成键撞车 = 两条不同消息同文本（如用户对
+ *  两次审批各回一条「1」），24h 窗会把第二条静默吞成 duplicate。60s 覆盖重投窗口，
+ *  又把误吞面收敛到「同一分钟内同文本」这一本就歧义的窄缝。 */
+const DEFAULT_SYNTHETIC_DEDUP_WINDOW_MS = 60 * 1000
 const DEFAULT_FIFO_MAX = 512
+export const MAX_GLOBAL_WAITERS = 256
+export const MAX_AGENT_WAITERS = 32
 /** 拒绝回执节流：每用户 60 秒至多一条（内存 Map，重启清零无妨）。 */
 const REPLY_THROTTLE_MS = 60 * 1000
+
+/**
+ * G-31：onMessage 显式消费优先级（数值小者先收到消息；同优先级按注册先后稳定排序）。
+ * 原实现是 Set 插入序即优先级——装配顺序（index.mjs 里 approval → questions →
+ * conversation 的注册次序）成了隐式契约，questions 的 attach() 还专门注释「必须在
+ * 审批路由注册之后调用」。显式化后任何装配顺序都得到同一判定链：
+ *   cardAction      ap:/aq: 显式动作负载（卡片按钮/编号回执线）
+ *   numberedReply   裸 1/2 编号回复（审批先于提问靠同优先级插入序：审批注册在前）
+ *   conversation    会话路由兜底（最后；前层未消费的消息才进 agent 会话）
+ */
+export const MESSAGE_PRIORITY = Object.freeze({
+  cardAction: 10,
+  numberedReply: 20,
+  default: 50,
+  conversation: 100,
+})
 
 /**
  * 创建入站总线。
@@ -29,7 +55,9 @@ const REPLY_THROTTLE_MS = 60 * 1000
  * @param {import('./pairing.mjs').createPairing} [options.pairing] - v0.7 配对码状态机（/pair 受理用）
  * @param {import('./store.mjs').store} [options.store] - 持久化 store（去重跨重启）
  * @param {object} [options.vault] - createTokenVault 实例
- * @param {number} [options.dedupWindowMs] - 去重窗口，默认 24h
+ * @param {number} [options.dedupWindowMs] - 去重窗口，默认 24h（平台原生 messageId）
+ * @param {number} [options.syntheticDedupWindowMs] - 合成 messageId 去重窗口，默认 60s（G-46）
+ * @param {object} [options.strings] - stringsOf(lang) 全文案表（bus 白名单回执 + decide 话术取词；缺省 zh）
  * @param {object} [options.logger] - cordis logger
  * @param {() => void} [options.onBootstrapRemint] - 引导码重铸回调（stderr 展示）
  */
@@ -40,45 +68,65 @@ export function createInboundBus(options = {}) {
   const store = options.store ?? null
   const vault = options.vault ?? null
   const dedupWindowMs = options.dedupWindowMs ?? DEFAULT_DEDUP_WINDOW_MS
-  const warn = (message) => {
-    try { options.logger?.warn?.('[dsh-notifier/inbound]', message) } catch { /* 日志失败绝不致命 */ }
-    // v0.6.1 双写 stderr：宿主 logger 不落 stdout 时告警仍可见（真机事故复盘）
-    try { console.error('[dsh-notifier/inbound]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const syntheticDedupWindowMs = options.syntheticDedupWindowMs ?? DEFAULT_SYNTHETIC_DEDUP_WINDOW_MS
+  const globalWaiterCap = Math.max(1, Math.min(MAX_GLOBAL_WAITERS, Number(options.maxWaiters) || MAX_GLOBAL_WAITERS))
+  const agentWaiterCap = Math.max(1, Math.min(MAX_AGENT_WAITERS, Number(options.maxWaitersPerAgent) || MAX_AGENT_WAITERS))
+  const log = createLog({ logger: options.logger, tag: '[dsh-notifier-gate/inbound]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
   const commands = identity !== null && pairing !== null
-    ? createCommandHandler({ identity, pairing, logger: options.logger, onBootstrapRemint: options.onBootstrapRemint })
+    ? createCommandHandler({ identity, pairing, logger: options.logger, onBootstrapRemint: options.onBootstrapRemint }, options.strings)
     : null
 
-  // 双层去重：内存 FIFO（快速路径）+ store（重启恢复）
-  const fifo = new Set()
+  // 双层去重：内存 FIFO（快速路径）+ store（重启恢复）。
+  // G-46 起条目带时间戳：短窗键（合成 messageId）到期自动放行——原实现是纯 Set，
+  // 条目只按容量淘汰不按时间过期，60s 短窗会被 FIFO 永久挡死（同文本第二条在
+  // 512 条新消息把它挤出去之前永远 duplicate）。
+  const fifo = new Map()
   const dedupKeyOf = (envelope) => `dedup:${envelope.channel}:${envelope.messageId}`
+  // G-46：合成键（adapter 侧内容哈希兜底）按 envelope 标记走短窗；平台原生 msgId 长窗不变。
+  const dedupWindowOf = (envelope) => envelope?.messageIdSynthetic === true ? syntheticDedupWindowMs : dedupWindowMs
 
-  // 拒绝回执节流表：userId -> lastReplyAt
+  // 拒绝回执节流表：(channel,userId) -> lastReplyAt；相同平台用户号在
+  // 不同渠道属于不同身份，不能互相节流。
   const replyThrottle = new Map()
 
   const waiters = new Map() // approvalKey -> { resolve, timer, settled }
-  const messageHandlers = new Set()
+  // G-31：handler -> { priority, seq }；扇出按 (priority asc, seq asc) 稳定排序。
+  const messageHandlers = new Map()
+  let handlerSeq = 0
   const agentWaiters = new Map()
   let disposed = false
 
   function isDuplicate(envelope, now = Date.now()) {
     const key = dedupKeyOf(envelope)
-    if (fifo.has(key)) return true
+    const fifoAt = fifo.get(key)
+    if (typeof fifoAt === 'number' && now - fifoAt < dedupWindowOf(envelope)) return true
     if (store !== null) {
       const seenAt = store.get(key)
-      if (typeof seenAt === 'number' && now - seenAt < dedupWindowMs) return true
+      if (typeof seenAt === 'number' && now - seenAt < dedupWindowOf(envelope)) return true
     }
     return false
   }
 
-  function remember(envelope, now = Date.now()) {
+  /** 只写内存 FIFO（有界，未绑定来源使用；不制造外部可写的 state 键）。 */
+  function rememberInMemory(envelope, now = Date.now()) {
     const key = dedupKeyOf(envelope)
-    fifo.add(key)
+    // 重置插入序：同 key 重复 remember 不占容量（Map.set 原地更新不挪位，语义无妨——
+    // 容量淘汰只关心界内条目数）
+    fifo.set(key, now)
     if (fifo.size > DEFAULT_FIFO_MAX) {
       const oldest = fifo.keys().next().value
       fifo.delete(oldest)
     }
-    if (store !== null) store.set(key, now)
+  }
+
+  /** 绑定成员使用内存 + 持久化，跨重启继续防重放。 */
+  function remember(envelope, now = Date.now()) {
+    rememberInMemory(envelope, now)
+    if (store !== null && setDurable(store, dedupKeyOf(envelope), now) !== true) {
+      warn(`去重记录未落盘：${dedupKeyOf(envelope)}`)
+    }
   }
 
   /** 引导态：绑定表空 + 旧白名单空（此时六通道照常启动，仅开放注册面）。 */
@@ -87,10 +135,11 @@ export function createInboundBus(options = {}) {
   }
 
   /** 节流判定：窗口内已回执过则吞掉本次（返回 false 表示应回执）。 */
-  function shouldReply(userId, now = Date.now()) {
-    const last = replyThrottle.get(String(userId)) ?? 0
+  function shouldReply(channel, userId, now = Date.now()) {
+    const key = JSON.stringify([String(channel ?? ''), String(userId ?? '')])
+    const last = replyThrottle.get(key) ?? 0
     if (now - last < REPLY_THROTTLE_MS) return false
-    replyThrottle.set(String(userId), now)
+    replyThrottle.set(key, now)
     if (replyThrottle.size > 1024) { // 有界：防长期运行内存无限涨
       const oldest = replyThrottle.keys().next().value
       replyThrottle.delete(oldest)
@@ -120,8 +169,8 @@ export function createInboundBus(options = {}) {
 
   return {
     /** 准入判定（默认全拒）。v0.7 复合键；旧调用 allows(userId) 仍兼容（扁平集合期语义）。 */
-    allows(channel, userId) {
-      if (identity !== null) return identity.allows(String(channel ?? ''), String(userId ?? ''))
+    allows(channel, userId, accountId = undefined) {
+      if (identity !== null) return identity.allows(String(channel ?? ''), String(userId ?? ''), accountId)
       const id = userId === undefined ? String(channel) : String(userId)
       return allow.has(id)
     },
@@ -145,7 +194,7 @@ export function createInboundBus(options = {}) {
         warn(`跳过重复入站消息：${envelope.channel}:${envelope.messageId}`)
         return { ok: false, reason: 'duplicate' }
       }
-      const bound = this.allows(envelope.channel, envelope.userId)
+      const bound = this.allows(envelope.channel, envelope.userId, envelope.accountId)
       const guided = isGuided()
 
       // 注册面命令：绑定成员与未绑定者均可触达（/whoami /pair 是准入前的自助面）
@@ -168,7 +217,10 @@ export function createInboundBus(options = {}) {
         remember(envelope)
         // v0.6.3 消费语义：handler 返回 true = 消息已被该处理器消费，停止扇出
         // （审批编号回复吃掉「1」后不再进对话路由，防同一消息双重消费）。
-        for (const handler of messageHandlers) {
+        // G-31：按显式 priority 稳定排序扇出（原 Set 插入序 = 隐式装配顺序契约）。
+        const ordered = [...messageHandlers.entries()]
+          .sort((a, b) => (a[1].priority - b[1].priority) || (a[1].seq - b[1].seq))
+        for (const [handler] of ordered) {
           try {
             if (handler(envelope) === true) break
           } catch (error) {
@@ -181,13 +233,13 @@ export function createInboundBus(options = {}) {
 
       // 未绑定：拒绝也记账（R5 审查 R5-3-P3-2：平台对未回执消息会重投，不 remember 则
       // 同一 messageId 每次重投都重走判定链——60s 节流只兜回执不兜 warn 刷屏）
-      remember(envelope)
+      // 未绑定来源只记内存：仍拦平台重投，但不允许陌生 messageId 无限放大 state.json。
+      rememberInMemory(envelope)
       // 拒绝回执（引导态文案带配对指引；普通态带联系管理员指引）
-      if (identity !== null && shouldReply(envelope.userId)) {
-        const idLine = `你的${getChannelName(envelope.channel)}身份是 ${envelope.userId}。`
-        const reply = guided
-          ? `${idLine}\n当前为引导模式（白名单为空）。发送 /pair <配对码> 完成绑定（首位绑定者成为 owner），配对码见宿主启动日志；/whoami 查看你的身份。`
-          : `${idLine}\n你不在白名单中。请联系管理员生成配对码，然后发送 /pair <配对码> 绑定。`
+      if (identity !== null && shouldReply(envelope.channel, envelope.userId)) {
+        const bt = options.strings?.bus ?? stringsOf().bus
+        const idLine = bt.identityLine(getChannelName(envelope.channel, options.strings), envelope.userId)
+        const reply = guided ? bt.guidedReply(idLine) : bt.whitelistReply(idLine)
         warn(`拒绝入站消息：${envelope.channel} user ${envelope.userId} 不在白名单${guided ? '（引导态）' : ''}`)
         return { ok: false, reason: guided ? 'guided' : 'whitelist', reply }
       }
@@ -195,9 +247,17 @@ export function createInboundBus(options = {}) {
       return { ok: false, reason: 'whitelist' }
     },
 
-    /** 订阅通过白名单+去重的文本消息（conversation router 用）。 */
-    onMessage(handler) {
-      messageHandlers.add(handler)
+    /**
+     * 订阅通过白名单+去重的文本消息（conversation router 用）。
+     * G-31：options.priority 显式声明消费优先级（数值小者先收到；缺省 default=50，
+     * 与旧插入序行为对齐——审批/提问/会话路由都已改传显式值）。同一 bus 实例上的
+     * 注册顺序不再是行为契约。
+     * @param {(envelope: object) => boolean | void} handler 返回 true = 消费并停止扇出
+     * @param {{ priority?: number }} [options]
+     * @returns {() => void} 反订阅
+     */
+    onMessage(handler, { priority = MESSAGE_PRIORITY.default } = {}) {
+      messageHandlers.set(handler, { priority: Number(priority) || 0, seq: (handlerSeq += 1) })
       return () => messageHandlers.delete(handler)
     },
 
@@ -206,6 +266,14 @@ export function createInboundBus(options = {}) {
       const existing = waiters.get(approvalKey)
       if (existing !== undefined && !existing.settled) return existing.promise
       const agentId = typeof options.agentId === 'string' ? options.agentId : ''
+      if (waiters.size >= globalWaiterCap) {
+        warn(`waiter 全局容量已满（${globalWaiterCap}），拒绝 ${approvalKey}`)
+        return Promise.resolve(null)
+      }
+      if (agentId !== '' && (agentWaiters.get(agentId)?.size ?? 0) >= agentWaiterCap) {
+        warn(`agent ${agentId} waiter 容量已满（${agentWaiterCap}），拒绝 ${approvalKey}`)
+        return Promise.resolve(null)
+      }
       const onAbandon = typeof options.onAbandon === 'function' ? options.onAbandon : null
       // v0.8.3 SEC-1：允许会话范围（channel → chatId 集合）。按钮裁决来源校验用；
       // 缺省 null = 不限制（编号回复/旧装配不受影响）。
@@ -274,14 +342,22 @@ export function createInboundBus(options = {}) {
         if (!verdict.ok) return { ok: false, reason: verdict.reason }
         if (verdict.key !== approvalKey) return { ok: false, reason: 'key-mismatch' }
       }
-      // v0.8.3 SEC-1：来源会话校验（仅按钮裁决路径）。wait 注册了允许会话范围时，
-      // 点击会话必须落在范围内；不匹配返回明确拒绝，不核销 wait 状态（合法原会话仍可裁决）。
-      // 缺省 allowChats=null 或 chatId 未传时跳过（编号回复/旧装配不受影响）。
+      // v0.8.3 SEC-1 → CRACK-002：来源会话校验（仅按钮裁决路径）改 fail-closed。
+      // 有源证据（allowChats 范围 + 点击 chatId）才算有效按钮路径，缺一即无来源授权 → 拒绝，
+      // 不核销 wait（合法原会话仍可裁决）；decideTrusted（编号回复）不走本分支，归属另校验。
       const entry = waiters.get(approvalKey)
-      if (entry !== undefined && entry.allowChats !== null && chatId !== undefined && chatId !== null && String(chatId) !== '') {
-        const allowed = entry.allowChats
+      if (entry === undefined) {
+        // 无 waiter：重放/已决。settle 会返回 already-resolved；不走本分支，保留 settle 语义。
+      } else {
+        const chatProvided = chatId !== undefined && chatId !== null && String(chatId) !== ''
+        const scopeProvided = entry.allowChats !== null && entry.allowChats !== undefined
+        if (!chatProvided || !scopeProvided) {
+          // 缺点击会话或缺来源范围：无法确证来源 → 显式拒绝，不核销 wait。
+          warn(`decide ${approvalKey} 来源校验失败（chatId 提供:${chatProvided}，allowChats:${scopeProvided}）`)
+          return { ok: false, reason: 'source-chat-mismatch', message: (options.strings?.verdict ?? stringsOf().verdict).sourceChatMismatch }
+        }
         const channel = String(via ?? '').split(':')[0]
-        const chatSet = allowed.get(channel)
+        const chatSet = entry.allowChats.get(channel)
         if (chatSet === undefined || !chatSet.has(String(chatId))) {
           return { ok: false, reason: 'source-chat-mismatch' }
         }
@@ -298,6 +374,10 @@ export function createInboundBus(options = {}) {
 
     pendingCount() {
       return waiters.size
+    },
+
+    pendingCountForAgent(agentId) {
+      return agentWaiters.get(String(agentId ?? ''))?.size ?? 0
     },
 
     dispose() {

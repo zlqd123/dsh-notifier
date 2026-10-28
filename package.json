@@ -1,63 +1,52 @@
 {
-  "name": "dsh-notifier",
-  "version": "0.8.5",
-  "description": "DSH 统一通知推送插件：一个 notify() API 打天下 + 多渠道 adapter；远程审批/远程会话支持 telegram/feishu/qq/wxpusher/wechat/dingtalk 六通道双向回传；移动指挥中心（长任务心跳 / 疑似卡住提醒 / 通知按钮停止任务）；开放事件源（其他插件经 notifier 服务推送 + dsh-notifier/sent 事件订阅）；QQ/钉钉/飞书官方扫码授权；本机 Web 管理台（凭证/路由/扫码授权网页可管，移动端适配）。零运行时依赖（只用 fetch + node:crypto + 原生 WebSocket）。",
+  "name": "dsh-notifier-gate",
+  "version": "0.13.1-qq.9",
+  "description": "DSH QQ 官方机器人通知插件（dsh-notifier 的 QQ 专项裁剪版）：仅保留 qq-bot 出站渠道（一律经 noti-gateway 投递）与 QQ 入站网关，配置完全自持。",
   "type": "module",
-  "main": "src/index.mjs",
+  "main": "src/plugin-entry.mjs",
   "exports": {
-    ".": "./src/index.mjs",
-    "./package.json": "./package.json"
+    ".": "./src/plugin-entry.mjs",
+    "./internal": "./src/index.mjs",
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "files": [
     "src",
-    "test",
-    "scripts",
     "cordis.patch.yml",
+    "client.js",
+    "README.md",
     "CHANGELOG.md"
   ],
-  "scripts": {
-    "test": "node --test \"test/*.test.mjs\" \"test/*.spec.mjs\""
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.1.7 <0.3.0"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
     }
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
-  },
-  "optionalDependencies": {
-    "@larksuiteoapi/node-sdk": "^1.61.1",
-    "@tencent-connect/qqbot-connector": "^1.2.0",
-    "qrcode-terminal": "^0.12.0"
-  },
-  "engines": {
-    "node": ">=22"
-  },
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/THEWOLFWALKER/dsh-notifier.git"
-  },
   "keywords": [
     "deepseek-harness",
     "dsh",
     "plugin",
     "notify",
     "notification",
-    "dingtalk",
-    "feishu",
-    "wxpusher",
-    "pushplus",
-    "serverchan",
-    "bark",
-    "telegram",
-    "webhook",
+    "qq",
     "qq-bot",
-    "weixin",
-    "ilink",
-    "qr-login",
-    "remote-approval"
+    "push-notifications"
   ],
   "dshWorkshop": {
     "schema": "omdsh-workshop-package/v1",
@@ -89,14 +78,16 @@
     ],
     "compatibility": {
       "dshVersions": [
-        "0.1.0-rc.6"
+        "0.1.7-rc.2",
+        "0.2.1-rc.2"
       ]
     },
     "capability": {
-      "id": "notify",
+      "id": "notify-qq",
       "kind": "tool",
-      "invocation": "invoke the model-facing notify tool with a message and an optional target channel through the DSH ToolRuntime",
-      "expected": "the message is delivered to the configured channel (e.g. Telegram) and a structured result is returned; an unreachable or unconfigured channel returns a structured skipped/failed result without blocking the turn"
+      "invocation": "invoke the model-facing notify tool with a message through the DSH ToolRuntime, or let the event listener push on turn completion",
+      "expected": "the notifier delivers to the configured QQ bot channel and returns a structured result; an unconfigured channel returns a structured skipped/failed result without blocking the turn",
+      "evidence": null
     },
     "evidence": {
       "install": null,

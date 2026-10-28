@@ -9,6 +9,102 @@ export function countCodepoints(text) {
   return Array.from(String(text ?? '')).length
 }
 
+/**
+ * 按 Unicode 码点切块：绝不产生孤立代理项（emoji/生僻字跨块安全）。
+ * G-03/G-22 同根修复：JS 字符串 slice 是 UTF-16 码元语义，星体平面字符（emoji、
+ * 生僻字）在块边界会被切成孤立代理项——微信 iLink 端显示乱码或拒收，QQ 端 JSON
+ * 载荷含非法序列。发送路径统一改用本 helper（微信 iLink 分块 + QQ 文本分段/Markdown
+ * 截断），与 segmentText 的码点预算语义同源。
+ * 已知降级：按码点（Array.from）切块，emoji ZWJ 序列（如 🏳️‍🌈 = 4 码点）或组合
+ * 字符序列仍可能在块边界被拆成多个「完整码点」——显示为两个符号，但不产生非法
+ * UTF-16 序列（对比码元切分的孤立代理项），属可接受降级。
+ * @param {string} text - 任意文本（null/undefined 归一为空串）
+ * @param {number} size - 每块码点数；非正/非法值退化为整段单块（宁可整段被渠道
+ *   截断，绝不死循环、绝不逐字符刷屏——与 segmentText 的退化语义一致）
+ * @param {{ preferSentenceBoundary?: boolean }} [options] - 置 true 时改走句末优先切块
+ *   （见 splitBySentenceBoundary）。默认 false，行为与历史完全一致。
+ * @returns {string[]} 块数组（空文本返回 []；拼接恒等于原文）
+ */
+export function splitByCodePoints(text, size, { preferSentenceBoundary = false } = {}) {
+  const chars = Array.from(String(text ?? ''))
+  const step = Math.floor(Number(size))
+  if (!(step >= 1)) return chars.length === 0 ? [] : [chars.join('')]
+  if (!preferSentenceBoundary) {
+    const out = []
+    for (let i = 0; i < chars.length; i += step) out.push(chars.slice(i, i + step).join(''))
+    return out
+  }
+  return splitBySentenceBoundary(chars, step)
+}
+
+/** 句末标点：中日文标点直接算，ASCII 标点须后接空白才算（见 isSentenceEndAt）。 */
+const SENTENCE_END_CHARS = new Set(['。', '！', '？', '…', '；', '!', '?', ';'])
+
+/** 句末标点后并入本句的尾随字符：重复标点、右引号/右括号，以及其后的空白。 */
+const SENTENCE_TRAILING_CHARS = new Set(['。', '！', '？', '…', '；', '」', '』', '”', '’', '）', ')', ' ', '\t', '\r'])
+
+/**
+ * 判断 chars[index] 是否为句末标点。
+ * ASCII 的 `!?;` 必须后接空白或文本结尾才算句末——否则 `3;14` 这类含标点的正文
+ * 会被误判成句子边界（中文标点无此歧义，直接算）。
+ */
+function isSentenceEndAt(chars, index) {
+  const ch = chars[index]
+  if (ch === '\n') return true
+  if (!SENTENCE_END_CHARS.has(ch)) return false
+  if (ch === '!' || ch === '?' || ch === ';') {
+    const next = chars[index + 1]
+    return next === undefined || next === ' ' || next === '\n' || next === '\t' || next === '\r'
+  }
+  return true
+}
+
+/**
+ * 按句末标点把字符数组切成「句」（分区：各句拼接恒等于原文）。
+ * 句末标点后的重复标点与右引号并入本句（`……`、`！」` 不被拆成两句）。
+ */
+function toSentences(chars) {
+  const sentences = []
+  let start = 0
+  for (let i = 0; i < chars.length; i += 1) {
+    if (!isSentenceEndAt(chars, i)) continue
+    let end = i + 1
+    while (end < chars.length && SENTENCE_TRAILING_CHARS.has(chars[end])) end += 1
+    sentences.push(chars.slice(start, end))
+    start = end
+    i = end - 1
+  }
+  if (start < chars.length) sentences.push(chars.slice(start))
+  return sentences
+}
+
+/**
+ * 贪心按句累积切块：把完整句子累到当前块，直到再加一句会超预算才落定——不把句子
+ * 劈成半截。单句本身超预算（无标点的长段落、纯 emoji 串）才在该句内部按 budget
+ * 硬切兜底。契约与 splitByCodePoints 同源：每块 ≤ budget 码点、拼接恒等于原文、
+ * 空文本返回 []、绝不停滞（每轮 budget ≥ 1 必推进）。
+ */
+function splitBySentenceBoundary(chars, budget) {
+  if (chars.length === 0) return []
+  const parts = []
+  let cur = []
+  for (const sentence of toSentences(chars)) {
+    if (sentence.length > budget) {
+      if (cur.length > 0) { parts.push(cur.join('')); cur = [] }
+      for (let i = 0; i < sentence.length; i += budget) parts.push(sentence.slice(i, i + budget).join(''))
+      continue
+    }
+    if (cur.length + sentence.length > budget) {
+      parts.push(cur.join(''))
+      cur = sentence.slice()
+      continue
+    }
+    for (const ch of sentence) cur.push(ch)
+  }
+  if (cur.length > 0) parts.push(cur.join(''))
+  return parts
+}
+
 /** 在 budget 码点内找最佳切点：换行 > 空格 > 硬切。返回 [head, rest]。 */
 function splitOnce(chars, budget) {
   const head = chars.slice(0, budget)

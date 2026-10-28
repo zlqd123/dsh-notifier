@@ -17,14 +17,35 @@
 // 频控：Bot 维度 60qpm ≈ 1 条/秒（复用出站 qq-bot 的限速门经验值）；被动回复
 // （带 msg_id 关联事件）有独立配额，5 条内免主动消息权限。
 
-import { createTokenManager, createRateGate } from '../adapters/_tokens.mjs'
+import { createTokenManager, createRateGate, normalizeTtlMs } from '../adapters/_tokens.mjs'
+import { setBounded, createThrottledWarn } from './_bounded.mjs'
 import { resolveNotifyTargets } from './target-guard.mjs'
 import { buildApprovalAction, parseApprovalAction, buildQuestionAction, parseQuestionAction } from './_contract.mjs'
+import { parseQQImageMessage, parseQqAttachments } from './message.mjs'
+import { splitByCodePoints } from './segment.mjs'
+import { stringsOf } from '../strings.mjs'
+import { createLog } from '../log.mjs'
 
 const TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken'
 const DEFAULT_API_BASE = 'https://api.sgroup.qq.com'
 const INTENT_GROUP_AND_C2C = 1 << 25
 const INTENT_INTERACTION = 1 << 26 // INTERACTION_CREATE：消息按钮点击回调（v0.8.4 按钮化）
+const CHAT_STATE_MAX = 1024
+/** 纯附件（无正文）占位正文：仅在信封确有附件时使用，投递链会剥离（conversation.mjs）。 */
+const IMAGE_PLACEHOLDER_TEXT = '[图片消息]'
+const FILE_PLACEHOLDER_TEXT = '[文件消息]'
+// 出站单条上限按 Unicode 码点计（非 UTF-16 码元）：文本 2000 / Markdown 3000（官方限制）。
+// 码点语义经 splitByCodePoints 保证——码元切片会把星体平面字符切成孤立代理项（G-22 同根）。
+const QQ_TEXT_MAX_CODEPOINTS = 2000
+const QQ_MARKDOWN_MAX_CODEPOINTS = 3000
+/** G-22：被动回复条数配额（QQ 官方平台限制：c2c 4 条 / 群 5 条，按同一 msg_id 的被动回复计）。
+ *  超限时平台静默丢弃（无错误码、无回执）——本侧不硬阻塞投递（硬阻塞把「可能仍送达」
+ *  变成「必然不送达」），仅 warn 出声让丢弃可见。主动消息（无 msg_id）不受此配额约束。 */
+const QQ_PASSIVE_REPLY_QUOTA = { user: 4, group: 5 }
+/** #26 对齐腾讯 dsh-qqbot 参考实现（`src/features/button-utils.ts` 的 BUTTON_LABEL_MAX=10）：
+ *  QQ keyboard 按钮 label 上限 ≤10 码点。按码点截断（不用 .length 的 UTF-16 语义——
+ *  emoji/星体字符按码元切会把代理项劈成两半，G-22 同根），超长取前 9 码点补省略号。 */
+const QQ_BUTTON_LABEL_MAX_CODEPOINTS = 10
 
 // WS op codes（QQ 网关协议）
 const OP_DISPATCH = 0
@@ -35,6 +56,10 @@ const OP_RECONNECT = 7
 const OP_INVALID_SESSION = 9
 const OP_HELLO = 10
 const OP_HEARTBEAT_ACK = 11
+
+/** G-07：close 4008（连接被限速）是服务端给出的硬性等待窗——按官方 SDK 语义固定等
+ *  60s 再重连，不走指数退避（限流期短退避重连等于连续撞墙，反而加剧限流）。 */
+const CLOSE_4008_WAIT_MS = 60000
 
 /**
  * 解析并校验 inbound.qq 配置。
@@ -67,9 +92,71 @@ export function resolveQqInboundConfig(raw, options = {}) {
   }
 }
 
-/** 群消息 content 常以 @机器人 占位开头（<@!BOTID> 或 @名字），剥掉再投递。 */
+/**
+ * G-40：群消息 @ 机器人占位白名单化——仅剥已证实形态，绝不「假定剥不掉也无害」。
+ * 已证实形态：`<@!数字ID>`、`<@数字ID>`（官方占位）与行首 `@名字+空格`（纯文本形态）。
+ * 未命中白名单但形似提及（以 @ / <@ 开头）→ 保留原文并由调用方 debug 出声：
+ * @ 残片会污染 agent 语境与 /pair 参数；平台若改格式，日志可见而非静默漏剥。
+ * 官方文档称群 content 已自动去 @ 前缀（docs/protocol-preflight/qq-bot.md），但真机
+ * 样本不足——白名单+出声是「漏剥可见」与「误剥可见」之间的保守中点。
+ */
+const MENTION_WHITELIST = [
+  /^<@!\d+>\s*/, // 官方占位形态一：<@!数字ID>（占位自定界，尾随空格可缺省）
+  /^<@\d+>\s*/, // 官方占位形态二：<@数字ID>
+  /^@\S+\s+/, // 纯文本形态：行首 @名字+空格（空格是「名字结束」判据，缺空格视为未知）
+]
+
+/** QQ keyboard 按钮 label 截断（#26 对齐腾讯 dsh-qqbot `button-utils.ts` 的
+ *  BUTTON_LABEL_MAX=10）：整体 ≤10 码点，超长取前 9 码点补省略号。按码点计
+ *  不产生孤立代理项（G-22 同根）。 */
+function clampButtonLabel(label) {
+  const points = Array.from(String(label ?? '').trim())
+  if (points.length <= QQ_BUTTON_LABEL_MAX_CODEPOINTS) return points.join('')
+  return points.slice(0, QQ_BUTTON_LABEL_MAX_CODEPOINTS - 1).join('') + '…'
+}
+
+/** 剥离群消息行首的 @ 机器人占位；返回 { text, matched, mentionLike }（matched=命中
+ *  白名单已剥；mentionLike=形似提及但未命中，调用方据此 debug 出声）。 */
 function stripMention(content) {
-  return String(content ?? '').replace(/^(<@![A-Za-z0-9_]+>|@\S+)\s*/, '').trim()
+  const text = String(content ?? '')
+  for (const pattern of MENTION_WHITELIST) {
+    if (pattern.test(text)) return { text: text.replace(pattern, '').trim(), matched: true }
+  }
+  return { text: text.trim(), matched: false, mentionLike: /^(@|<@)/.test(text) }
+}
+
+/**
+ * 收集事件 d 负载上的全部附件（#36）：官方 `attachments` 段优先（图片/文件，逐项白名单归一），
+ * 当官方段未给出图片时回落文档假设形状的 `extra` 图片段（真机证据不足，保持过渡支持）。
+ * 任一段形状未知一律丢弃，绝不伪装成文本或控制字段。
+ * @param {object} d - 消息事件负载
+ * @returns {Array<{ kind: 'image'|'file', image?: object, file?: object }>}
+ */
+function collectMessageAttachments(d) {
+  const list = parseQqAttachments(d)
+  if (!list.some((item) => item.kind === 'image')) {
+    const legacy = parseQQImageMessage(d)
+    if (legacy !== null) list.unshift(legacy)
+  }
+  return list
+}
+
+/** 纯附件（无正文）占位正文：有图片用图片占位，否则用文件占位（投递链会剥离）。 */
+const placeholderOf = (attachments) =>
+  (attachments.some((item) => item.kind === 'image') ? IMAGE_PLACEHOLDER_TEXT : FILE_PLACEHOLDER_TEXT)
+
+/**
+ * 信封的附件字段：规范形状 `attachments: []`；同时保留首图 `image` 单项字段（过渡期消费者
+ * 仍读它，见 conversation.mjs::collectAttachments），无正文时附 `kind` 供下游识别纯附件消息。
+ */
+function attachmentFields(attachments, withoutText) {
+  if (attachments.length === 0) return {}
+  const firstImage = attachments.find((item) => item.kind === 'image')
+  return {
+    attachments,
+    ...(firstImage === undefined ? {} : { image: firstImage.image }),
+    ...(withoutText ? { kind: attachments[0].kind } : {}),
+  }
 }
 
 /**
@@ -94,26 +181,62 @@ function stripMention(content) {
  * @param {typeof WebSocket} [options.webSocketImpl] - WebSocket 构造器注入（测试用；默认 globalThis.WebSocket）
  * @param {number} [options.reconnectBaseMs=1000] - 重连退避基数
  * @param {number} [options.reconnectCapMs=30000] - 重连退避上限
+ * @param {number} [options.handshakeTimeoutMs=10000] - WS open/HELLO/READY 各阶段截止时间
+ * @param {object} [options.strings] - stringsOf(lang) 全文案表（读 `qq` 节，跨节复用
+ *   approval.fallbackText；缺省回落 zh——须先在 strings.mjs 落 `qq` 节）
  */
 export function createQqInbound(options = {}) {
   const { config, bus, fallbackTargets = [], logger = null, identity = null } = options
+  const STRINGS = options.strings ?? stringsOf()
+  const t = STRINGS.qq
   // 防御性兜底：绕过 resolveQqInboundConfig 直接构造时也保证 apiBase 可用
   const apiBase = (String(config?.apiBase ?? '').trim() || DEFAULT_API_BASE).replace(/\/+$/, '')
   const fetchImpl = options.fetchImpl ?? globalThis.fetch?.bind(globalThis)
   const WebSocketImpl = options.webSocketImpl ?? globalThis.WebSocket
   const reconnectBaseMs = Math.max(1, Number(options.reconnectBaseMs) || 1000)
   const reconnectCapMs = Math.max(reconnectBaseMs, Number(options.reconnectCapMs) || 30000)
+  const handshakeTimeoutMs = Math.max(10, Number(options.handshakeTimeoutMs) || 10000)
+  // G-07：close 4008 的固定等待窗（默认 60s；测试注入缩短，不参与指数退避）
+  const close4008WaitMs = Math.max(0, Number(options.close4008WaitMs) || CLOSE_4008_WAIT_MS)
+  const ackThreshold = Number(options.maxMissedAcks)
+  const maxMissedAcks = Number.isFinite(ackThreshold) && ackThreshold >= 1 ? Math.min(10, Math.floor(ackThreshold)) : 2
 
-  const warn = (message) => {
-    try { logger?.warn?.('[dsh-notifier/inbound:qq]', message) } catch { /* 日志失败绝不致命 */ }
-    // v0.6.1 双写 stderr：宿主 logger 不落 stdout 时轮询/装配告警仍可见（真机事故复盘）
-    try { console.error('[dsh-notifier/inbound:qq]', message) } catch { /* 控制台不可用不致命 */ }
+  // 统一日志出口：故障(warn/error)双写可见；连接生命周期(info)只进 logger，
+  // 不再让「已就绪 / 断线恢复 / 会话轮转」每次重连都刷控制台。
+  const log = createLog({ logger, tag: '[dsh-notifier-gate/inbound:qq]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
+  const debug = (message) => log.debug(message)
+  const evictionWarn = createThrottledWarn(warn, { intervalMs: 1000 })
+  const onEvict = (key) => evictionWarn((count) => `目标类型学习表达上限：淘汰 ${count} 个旧目标（最近淘汰 ${String(key).slice(0, 32)}）`)
+
+  // 连接生命周期计数（日志降噪用）：4009/op7 这类"平台侧正常会话轮转"在稳态下会周期性
+  // 出现，只让首次出声，之后降为 debug，避免日志被「已就绪/闭码」刷成看起来像故障。
+  let sessionRotationCount = 0
+  let readyCount = 0
+
+  // #31 入站 transport 有限超时：config.timeoutMs 此前仅解析从未注入——换 token/发消息/
+  // 回执/卡片全走裸 fetchImpl（无 signal），宿主线程或网络卡死时这些调用可无限挂起。
+  // 注入 AbortController+signal（对齐 telegram-bot.mjs 先例与 _shared.mjs postJson 超时
+  // 语义）；超时 AbortError 由调用方 catch：token 失败进 token 管理器既有传播，发送失败
+  // 走既有 warn+降级，不盲目重试（结果未知时重试会重复投递，见 _shared.mjs G-50 同根）。
+  // 数值归一（clamp [1000,60000]）由 resolveQqInboundConfig 负责，此处只兜底缺省值。
+  const requestTimeoutMs = Number(config?.timeoutMs) || 10000
+  function fetchWithTimeout(url, init = {}) {
+    if (fetchImpl === undefined) return Promise.reject(new Error('当前运行时无 fetch，QQ inbound 不可用'))
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    return Promise.resolve(fetchImpl(url, { ...init, signal: controller.signal }))
+      .then(
+        (response) => { clearTimeout(timer); return response },
+        (error) => { clearTimeout(timer); throw error },
+      )
   }
 
   // token 管理器（换 token → 缓存 → 提前刷新 → 失效作废），与出站 qq-bot 同一套逻辑
   const tokens = createTokenManager(async () => {
     if (fetchImpl === undefined) throw new Error('当前运行时无 fetch，QQ inbound 不可用')
-    const response = await fetchImpl(TOKEN_URL, {
+    const response = await fetchWithTimeout(TOKEN_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ appId: config.appId, clientSecret: config.appSecret }),
@@ -122,7 +245,8 @@ export function createQqInbound(options = {}) {
     if (typeof payload?.access_token !== 'string' || payload.access_token === '') {
       throw new Error(`换取 access_token 失败（HTTP ${response.status}）：检查 appId/appSecret`)
     }
-    return { token: payload.access_token, expiresInMs: (Number(payload.expires_in) || 7200) * 1000 }
+    // G-55：与出站 qq-bot 同一归一——expires_in 非法（非有限/≤0）不再 || 7200 掩盖
+    return { token: payload.access_token, expiresInMs: normalizeTtlMs(Number(payload.expires_in) * 1000, 'expires_in') }
   })
   const rateGate = createRateGate(1050) // 60qpm ≈ 1 条/秒
 
@@ -132,11 +256,15 @@ export function createQqInbound(options = {}) {
   let stopRequested = false
   let ws = null
   let heartbeatTimer = null
+  let heartbeatIntervalMs = null
+  let heartbeatArmed = false
   let lastSeq = null
   let sessionId = null
   let awaitingAck = false
+  let missedAcks = 0
   let reconnectAttempts = 0
   let reconnectTimer = null
+  let handshakeTimer = null
   // 发送侧运行态：目标类型学习表（事件来时记下 chatId 是单聊还是群）+ 每目标 msg_seq
   const targetKinds = new Map() // chatId -> 'user' | 'group'
   const msgSeqs = new Map() // chatId -> 递增 seq
@@ -147,10 +275,12 @@ export function createQqInbound(options = {}) {
     return (config.notifyGroups ?? []).includes(String(chatId)) ? 'group' : 'user'
   }
 
-  function scheduleReconnect({ resume = false } = {}) {
+  function scheduleReconnect({ resume = false, delayMs = null } = {}) {
     if (stopRequested) return
     if (reconnectTimer !== null) return
-    const delay = Math.min(reconnectBaseMs * 2 ** reconnectAttempts, reconnectCapMs)
+    // G-07：4008（连接被限速）服务端给出的是硬性等待窗，不用指数退避——按计划固定 60s
+    const delay = delayMs !== null ? Math.max(0, delayMs)
+      : Math.min(reconnectBaseMs * 2 ** reconnectAttempts, reconnectCapMs)
     reconnectAttempts += 1
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null
@@ -166,7 +296,13 @@ export function createQqInbound(options = {}) {
   }
 
   function cleanupSocket() {
+    if (handshakeTimer !== null) { clearTimeout(handshakeTimer); handshakeTimer = null }
     if (heartbeatTimer !== null) { clearTimeout(heartbeatTimer); heartbeatTimer = null }
+    // 连接级心跳运行态复位：断开/重连/cleanup 后不得继承上一连接的脏 arming/ACK/miss 状态。
+    // heartbeatIntervalMs 保留——重连后同一会话的节奏由新连接 HELLO 重新下发（仅作兜底用）。
+    heartbeatArmed = false
+    awaitingAck = false
+    missedAcks = 0
     if (ws !== null) {
       try { ws.removeAllListeners?.() } catch { /* fake/运行时差异 */ }
       try { ws.close() } catch { /* 已关闭 */ }
@@ -174,9 +310,63 @@ export function createQqInbound(options = {}) {
     }
   }
 
+  function armHandshakeDeadline(phase, conn) {
+    if (handshakeTimer !== null) clearTimeout(handshakeTimer)
+    handshakeTimer = setTimeout(() => {
+      handshakeTimer = null
+      if (stopRequested || ws !== conn) return
+      warn(`QQ 网关 ${phase} 超时（${handshakeTimeoutMs}ms），主动断开并重连`)
+      cleanupSocket()
+      scheduleReconnect({ resume: sessionId !== null })
+    }, handshakeTimeoutMs)
+  }
+
+  function clearHandshakeDeadline() {
+    if (handshakeTimer !== null) { clearTimeout(handshakeTimer); handshakeTimer = null }
+  }
+
+  /** G-07：关闭码分支表（对齐官方 SDK reconnect 语义，dsh-im qqbot-connector 同源）：
+   *  - 4004 认证失败：token 已被平台吊销——作废 token 缓存（此前全文件无一处
+   *    tokens.invalidate()，带着死凭证无限重连直到 TTL 自然过期）+ 弃会话重 IDENTIFY
+   *  - 4008 连接被限速：服务端硬性等待窗，固定等（不走指数退避）；会话仍有效走 RESUME
+   *  - 4006 seq 非法 / 4007 shard 无效 / 4009 会话超时：会话不可恢复，弃之重 IDENTIFY
+   *  - 其余（1000 正常关闭 / 1006 异常断开 / 无码）：现行为——RESUME 优先 + 指数退避 */
+  function scheduleReconnectForClose(code) {
+    if (code === 4004) {
+      warn('QQ 网关认证失败（close 4004）：作废 access_token 缓存重取，弃会话重新 IDENTIFY')
+      tokens.invalidate()
+      sessionId = null
+      lastSeq = null
+      scheduleReconnect({ resume: false })
+      return
+    }
+    if (code === 4008) {
+      warn(`QQ 网关连接被限速（close 4008）：按服务端等待窗固定 ${Math.round(close4008WaitMs / 1000)}s 后 RESUME（不走指数退避）`)
+      scheduleReconnect({ resume: true, delayMs: close4008WaitMs })
+      return
+    }
+    if (code === 4006 || code === 4007 || code === 4009) {
+      // 4009 是 QQ 平台侧的常规会话轮转（同账号多端登录/服务端换节点都会触发），
+      // 重连成功后一切正常。若每次都用 warn 打印「闭码 + 已就绪」两条，稳态下会
+      // 刷成日志噪音，看起来像插件在反复出错。这里改为：
+      //  - 只记一行，带累计次数；首次 warn 之后降为 debug（仍可在详细日志里查到）
+      //  - 「已就绪」那条同样只在首次连接时出声
+      // 真正需要关注的 4004/4008 仍然无条件 warn。
+      sessionRotationCount += 1
+      const note = `QQ 网关闭码 ${code}：会话不可恢复，弃会话重新 IDENTIFY（第 ${sessionRotationCount} 次会话轮转，属正常重连）`
+      if (sessionRotationCount === 1) warn(note)
+      else debug(note)
+      sessionId = null
+      lastSeq = null
+      scheduleReconnect({ resume: false })
+      return
+    }
+    scheduleReconnect({ resume: true })
+  }
+
   async function fetchGatewayUrl() {
     const token = await tokens.get()
-    const response = await fetchImpl(`${apiBase}/gateway`, {
+    const response = await fetchWithTimeout(`${apiBase}/gateway`, {
       headers: { authorization: `QQBot ${token}` },
     })
     const payload = await response.json().catch(() => null)
@@ -191,37 +381,65 @@ export function createQqInbound(options = {}) {
     try { ws.send(JSON.stringify(payload)) ; return true } catch { return false }
   }
 
-  function startHeartbeat(intervalMs) {
-    // 标准模式：每次 beat 检查上一次是否已 ACK；未 ACK 即判死重连（无独立 watchdog，
-    // 间隔本身就是粒度，避免「watchdog 被后续 beat 不断重置」的死穴）。
-    // awaitingAck 是连接级状态：新连接起搏前必须复位，否则上一连接的未确认心跳
-    // 会把新连接的第一拍直接判死（曾导致重连后 RESUME/IDENTIFY 发不出去）。
+  /** Issue #23：HELLO 只记录本连接的 heartbeat_interval，不发送、也不启动心跳。
+   *  真机 A/B 证据：QQ 网关只对 READY/RESUMED 之后发出的心跳回 OP_HEARTBEAT_ACK，
+   *  鉴权完成前起搏只会白耗且永远收不到 ACK，必然走到阈值判死死循环。故此函数
+   *  只落盘 interval 并复位连接级心跳运行态，真正的起搏交给 armHeartbeat()（READY/RESUMED 触发）。 */
+  function recordHeartbeatInterval(intervalMs) {
+    heartbeatIntervalMs = intervalMs
+    heartbeatArmed = false
     awaitingAck = false
+    missedAcks = 0
+  }
+
+  /** Issue #23：READY/RESUMED 后才幂等启动心跳，并立即发送第一拍（携带当时最新 lastSeq）。
+   *  幂等：重复 READY/RESUMED 不得创建多个定时器或重复首拍。
+   *  单拍丢 ACK 且未达阈值时：记一次 miss、告警、仍发送下一拍（恢复路径不断）。 */
+  function armHeartbeat() {
+    if (heartbeatArmed) return
+    if (heartbeatIntervalMs === null) return
+    heartbeatArmed = true
+    awaitingAck = false
+    missedAcks = 0
     const beat = () => {
+      if (heartbeatTimer === null) return // 连接已清理，本闭包随旧定时器废弃
       if (awaitingAck) {
-        warn('心跳 ACK 超时（上一个心跳未确认），主动断开重连')
-        cleanupSocket()
-        scheduleReconnect({ resume: true })
-        return
+        missedAcks += 1
+        if (missedAcks < maxMissedAcks) {
+          warn(`心跳 ACK 已连续丢失 ${missedAcks}/${maxMissedAcks} 拍（下一拍仍无 ACK 才断线重连）`)
+        } else {
+          warn(`心跳 ACK 已连续丢失 ${missedAcks}/${maxMissedAcks} 拍，判死主动断开重连`)
+          cleanupSocket()
+          scheduleReconnect({ resume: true })
+          return // 达到阈值：本拍不再发送（清 socket 后经 RESUME 优先重连）
+        }
       }
       if (!sendFrame({ op: OP_HEARTBEAT, d: lastSeq })) return
       awaitingAck = true
     }
     if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
-    heartbeatTimer = setInterval(beat, Math.max(50, intervalMs))
+    heartbeatTimer = setInterval(beat, Math.max(50, heartbeatIntervalMs))
     beat()
   }
 
   function handleDispatch(t, d) {
     if (t === 'READY') {
+      clearHandshakeDeadline()
       reconnectAttempts = 0
       sessionId = String(d?.session_id ?? '') || null
-      warn(`QQ 网关已就绪（session ${sessionId ?? '?'}）`)
+      readyCount += 1
+      // 稳态下会话轮转会反复 READY：首次出声，之后降 debug（避免日志刷屏）
+      // 就绪属正常生命周期：info（只进 logger）；重复轮转降 debug。
+      if (readyCount === 1) info(`QQ 网关已就绪（session ${sessionId ?? '?'}）`)
+      else debug(`QQ 网关已就绪（session ${sessionId ?? '?'}，第 ${readyCount} 次）`)
+      armHeartbeat() // Issue #23：鉴权完成（READY）后才幂等启动心跳，立即发首拍
       return
     }
     if (t === 'RESUMED') {
+      clearHandshakeDeadline()
       reconnectAttempts = 0
-      warn('QQ 网关断线恢复（RESUME 成功，事件不丢）')
+      info('QQ 网关断线恢复（RESUME 成功，事件不丢）')
+      armHeartbeat() // Issue #23：RESUMED 后同样起搏（幂等，避免重复 READY/RESUMED 建多定时器）
       return
     }
     try {
@@ -229,12 +447,21 @@ export function createQqInbound(options = {}) {
         const userId = String(d?.author?.user_openid ?? '')
         const messageId = String(d?.id ?? '')
         const text = String(d?.content ?? '').trim()
-        if (messageId === '' || userId === '' || text === '') return
-        targetKinds.set(userId, 'user')
+        // #36：官方 `attachments` 段为规范来源（图片/文件），`extra` 图片段为其过渡兜底。
+        // 两者都只保留已知字段；malformed/未知形状的项直接丢弃，绝不变成文本或控制数据。
+        const attachments = collectMessageAttachments(d)
+        if (messageId === '' || userId === '' || (text === '' && attachments.length === 0)) return
+        setBounded(targetKinds, userId, 'user', CHAT_STATE_MAX, onEvict)
         // v0.7：accept 返回值消费——拒绝/命令回执不再已读不回。
         // msg_id 必带（R5 审查 R5-3-P2-3：C2C 不带 msg_id 走主动消息额度，真机大概率被
         // 平台 4xx 拒掉——mock fetch 不校验被动回复权限，单测测不出；带 msg_id 走被动回复）
-        const result = bus.accept({ channel: 'qq', userId, chatId: userId, messageId, text })
+        const envelope = {
+          channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId: userId, messageId,
+          chatType: 'private',
+          text: text || placeholderOf(attachments),
+          ...attachmentFields(attachments, text === ''),
+        }
+        const result = bus.accept(envelope)
         if (result?.reply !== undefined) {
           postMessage(userId, String(result.reply), messageId).catch((error) => {
             warn(`回执发送失败: ${error instanceof Error ? error.message : String(error)}`) // 回执失败不致命
@@ -246,11 +473,23 @@ export function createQqInbound(options = {}) {
         const userId = String(d?.author?.member_openid ?? '')
         const chatId = String(d?.group_openid ?? '')
         const messageId = String(d?.id ?? '')
-        const text = stripMention(d?.content)
-        if (messageId === '' || userId === '' || chatId === '' || text === '') return
-        targetKinds.set(chatId, 'group')
+        // G-40：白名单未命中但形似提及 → 保留原文 + debug 出声（@ 残片会污染 agent 语境
+        // 与 /pair 参数；平台改格式时靠日志发现而非静默漏剥）。头部截 32 字符便于采样。
+        const mention = stripMention(d?.content)
+        if (mention.mentionLike === true) {
+          debug(`群消息 @ 形态未命中白名单，已保留原文（QQ @ 占位真机样本不足，出现即需采样登记）: ${JSON.stringify(String(d?.content ?? '').slice(0, 32))}`)
+        }
+        const text = mention.text
+        // #36：群 @ 事件与 C2C 同源（官方 `attachments` 段），同样只收已知字段。
+        const attachments = collectMessageAttachments(d)
+        if (messageId === '' || userId === '' || chatId === '' || (text === '' && attachments.length === 0)) return
+        setBounded(targetKinds, chatId, 'group', CHAT_STATE_MAX, onEvict)
         // v0.7：群聊拒绝回执发回群（含「请私聊发送 /pair」引导）
-        const result = bus.accept({ channel: 'qq', userId, chatId, messageId, text })
+        const result = bus.accept({
+          channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId, messageId, chatType: 'group',
+          text: text || placeholderOf(attachments),
+          ...attachmentFields(attachments, text === ''),
+        })
         if (result?.reply !== undefined) {
           postMessage(chatId, String(result.reply), messageId).catch((error) => {
             warn(`回执发送失败: ${error instanceof Error ? error.message : String(error)}`) // 回执失败不致命
@@ -266,45 +505,39 @@ export function createQqInbound(options = {}) {
         if (type !== 11) return
         const interactionId = String(d?.id ?? '')
         const buttonData = String(d?.data?.resolved?.button_data ?? '')
-        const userId = String(d?.user_openid ?? d?.group_member_openid ?? '')
-        const chatId = String(d?.user_openid ?? d?.group_openid ?? '')
+        const userId = String(d?.group_member_openid ?? d?.user_openid ?? '')
+        const groupOpenId = String(d?.group_openid ?? '')
+        const userOpenId = String(d?.user_openid ?? '')
+        const chatId = String(groupOpenId || userOpenId)
         if (interactionId === '' || userId === '' || chatId === '') return
         void ackInteraction(interactionId).catch((error) => {
           warn(`互动 ACK 失败: ${error instanceof Error ? error.message : String(error)}`)
         })
-        targetKinds.set(chatId, chatId === userId ? 'user' : 'group')
+        setBounded(targetKinds, chatId, chatId === userId ? 'user' : 'group', CHAT_STATE_MAX, onEvict)
+        const chatType = groupOpenId !== '' ? 'group' : 'private'
         const parsed = parseApprovalAction(buttonData)
-        if (parsed !== null) {
-          const result = bus.accept({
-            channel: 'qq',
-            userId,
-            chatId,
-            messageId: interactionId,
-            text: `[审批按钮:${parsed.decision}] ${parsed.approvalKey}`,
-            approvalAction: { decision: parsed.decision, approvalKey: parsed.approvalKey, token: parsed.token },
-          })
-          if (result?.reply !== undefined) {
-            postMessage(chatId, String(result.reply), interactionId).catch((error) => {
-              warn(`按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
-            })
-          }
+        const question = parseQuestionAction(buttonData)
+        if (question !== null) {
+          const result = bus.accept({ channel: 'qq', accountId: String(config?.appId ?? ''), userId, chatId, chatType, messageId: interactionId,
+            text: `[提问按钮:${question.optIdx}] ${question.qKey}`,
+            questionAction: question })
+          if (result?.reply !== undefined) postMessage(chatId, String(result.reply), interactionId).catch(() => {})
           return
         }
-        // v0.8.x 提问按钮：aq:<qKey>:<optIdx|s|c>:<token>（选项下标 / s=跳过 / c=自定义
-        // 教学）。与审批按钮同一分发面、互斥前缀；非本插件按钮静默忽略。
-        const qParsed = parseQuestionAction(buttonData)
-        if (qParsed === null) return
-        const qResult = bus.accept({
+        if (parsed === null) return
+        const result = bus.accept({
           channel: 'qq',
+          accountId: String(config?.appId ?? ''),
           userId,
           chatId,
+          chatType,
           messageId: interactionId,
-          text: `[提问按钮:${qParsed.optIdx}] ${qParsed.qKey}`,
-          questionAction: { qKey: qParsed.qKey, optIdx: qParsed.optIdx, token: qParsed.token },
+          text: `[审批按钮:${parsed.decision}] ${parsed.approvalKey}`,
+          approvalAction: { decision: parsed.decision, approvalKey: parsed.approvalKey, token: parsed.token },
         })
-        if (qResult?.reply !== undefined) {
-          postMessage(chatId, String(qResult.reply), interactionId).catch((error) => {
-            warn(`提问按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
+        if (result?.reply !== undefined) {
+          postMessage(chatId, String(result.reply), interactionId).catch((error) => {
+            warn(`按钮回执发送失败: ${error instanceof Error ? error.message : String(error)}`)
           })
         }
         return
@@ -343,12 +576,17 @@ export function createQqInbound(options = {}) {
     if (typeof frame?.s === 'number') lastSeq = frame.s
     if (frame.op === OP_HELLO) {
       const intervalMs = Number(frame.d?.heartbeat_interval) || 30000
+      // Issue #23：HELLO 只记录本连接 heartbeat_interval 并发送鉴权，不启动心跳。
+      // 心跳须待 READY/RESUMED 鉴权完成后由 armHeartbeat() 幂等启动（真机 A/B 证据：
+      // 网关只对鉴权完成后的心跳回 OP_HEARTBEAT_ACK，提前起搏永远收不到 ACK 而死循环）。
+      recordHeartbeatInterval(intervalMs)
+      if (ws !== null) armHandshakeDeadline('READY/RESUMED', ws)
       sendAuth({ resume: sessionId !== null })
-      startHeartbeat(intervalMs)
       return
     }
     if (frame.op === OP_HEARTBEAT_ACK) {
       awaitingAck = false
+      missedAcks = 0
       return
     }
     if (frame.op === OP_DISPATCH) {
@@ -356,17 +594,25 @@ export function createQqInbound(options = {}) {
       return
     }
     if (frame.op === OP_RECONNECT) {
-      warn('服务端要求重连（op7）')
+      // op7 是平台常规的"换节点/主动要求重连"指令，稳态下会周期性出现，
+      // 不属于故障——降为 debug，避免与 4009 一起刷屏。
+      debug('服务端要求重连（op7）')
       cleanupSocket()
       scheduleReconnect({ resume: true })
       return
     }
     if (frame.op === OP_INVALID_SESSION) {
-      warn('会话失效（op9）：丢弃 session 重新 IDENTIFY')
-      sessionId = null
-      lastSeq = null
+      // G-21：按官方 SDK 语义看 d 标志——d:true 会话仍可恢复（保留 session 走 RESUME，
+      // 事件续传不丢）；d:false 会话已死才弃之重 IDENTIFY。旧实现一律弃会话：
+      // 每次可恢复失效都多付一次 IDENTIFY 握手 + 丢失续传窗。
+      const resumable = frame.d === true
+      warn(`会话失效（op9）：${resumable ? '可恢复，保留 session 走 RESUME' : '不可恢复，弃会话重新 IDENTIFY'}`)
+      if (!resumable) {
+        sessionId = null
+        lastSeq = null
+      }
       cleanupSocket()
-      scheduleReconnect({ resume: false })
+      scheduleReconnect({ resume: resumable })
     }
   }
 
@@ -375,42 +621,71 @@ export function createQqInbound(options = {}) {
     if (stopRequested) return
     if (WebSocketImpl === undefined) throw new Error('当前运行时无 WebSocket（需要 Node 22+）')
     ws = new WebSocketImpl(url)
-    ws.addEventListener('open', () => { /* 等 HELLO */ })
+    const conn = ws
+    armHandshakeDeadline('open', conn)
+    ws.addEventListener('open', () => {
+      if (ws !== conn) return
+      armHandshakeDeadline('HELLO', conn)
+    })
     ws.addEventListener('message', (event) => {
+      // Issue #23：连接级隔离——旧连接（已被 cleanupSocket 置 ws=null 或换成新连接）的
+      // 迟到帧（含 op11 ACK）不得触碰新连接的心跳运行态或 reset 新连接的 awaitingAck。
+      if (ws !== conn) return
       try { handleFrame(typeof event.data === 'string' ? event.data : String(event.data)) } catch (error) {
         warn(`帧处理异常: ${error instanceof Error ? error.message : String(error)}`)
       }
     })
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (event) => {
       cleanupSocket()
-      scheduleReconnect({ resume: true })
+      // G-07：关闭码带语义——4004 刷 token / 4008 固定窗 / 4006/4007/4009 弃会话
+      scheduleReconnectForClose(Number(event?.code))
     })
     ws.addEventListener('error', () => { /* close 会跟着来，重连在 close 里统一调度 */ })
   }
 
+  /** 发文本：超长按码点分段逐条发送（每段独立 msg_seq，服务端按 msg_id+msg_seq 去重）。
+   *  G-22 同根修复：旧 slice(0, 2000) 是 UTF-16 码元语义，第 2000 码元恰落在星体平面
+   *  字符（emoji/生僻字）中间时产生孤立代理项（JSON 载荷非法，平台拒收或乱码）。
+   *  分段点优先落在句末标点：硬切会把一句切成两条消息（后半截以残句开头，用户需自行
+   *  拼接）；无标点的长段落（纯 emoji、大段代码）退化为等长硬切，与历史行为一致。
+   *  G-22 配额：被动回复（携带 msg_id）分段数超平台配额时 warn 出声但不阻塞（超限部分
+   *  平台静默丢弃，先让丢弃可见——见 QQ_PASSIVE_REPLY_QUOTA 注释）。
+   *  任一段失败即抛错（已发段不撤回，与 iLink 分块语义一致）。 */
   async function postMessage(chatId, content, msgId = undefined) {
     if (fetchImpl === undefined) return null
     const token = await tokens.get()
-    await rateGate.gate()
     const target = String(chatId)
-    const seq = (msgSeqs.get(target) ?? 0) + 1
-    msgSeqs.set(target, seq)
     const kind = targetKindOf(target)
     const url = kind === 'group'
       ? `${apiBase}/v2/groups/${target}/messages`
       : `${apiBase}/v2/users/${target}/messages`
-    const body = { content: String(content ?? '').slice(0, 2000), msg_type: 0, msg_seq: seq }
-    if (msgId !== undefined) body.msg_id = msgId
-    const response = await fetchImpl(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
-      body: JSON.stringify(body),
-    })
-    const payload = await response.json().catch(() => null)
-    if (!response.ok || (typeof payload?.code === 'string' && payload.code !== '')) {
-      throw new Error(`QQ 发送失败（HTTP ${response.status}${payload?.code ? ` code ${payload.code}` : ''}: ${payload?.message ?? ''}）`)
+    const chunks = splitByCodePoints(String(content ?? ''), QQ_TEXT_MAX_CODEPOINTS, { preferSentenceBoundary: true })
+    const pieces = chunks.length > 0 ? chunks : ['']
+    if (msgId !== undefined) {
+      const quota = kind === 'group' ? QQ_PASSIVE_REPLY_QUOTA.group : QQ_PASSIVE_REPLY_QUOTA.user
+      if (pieces.length > quota) {
+        warn(`被动回复分段 ${pieces.length} 条超过${kind === 'group' ? '群' : 'c2c'}配额 ${quota} 条：超限部分平台将静默丢弃（本侧不硬阻塞，已照发）: ${target}`)
+      }
     }
-    return typeof payload?.id === 'string' && payload.id !== '' ? payload.id : `qq:${target}:${seq}`
+    let lastId = null
+    for (const piece of pieces) {
+      await rateGate.gate()
+      const seq = (msgSeqs.get(target) ?? 0) + 1
+      setBounded(msgSeqs, target, seq, CHAT_STATE_MAX, onEvict)
+      const body = { content: piece, msg_type: 0, msg_seq: seq }
+      if (msgId !== undefined) body.msg_id = msgId
+      const response = await fetchWithTimeout(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
+        body: JSON.stringify(body),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || (typeof payload?.code === 'string' && payload.code !== '')) {
+        throw new Error(`QQ 发送失败（HTTP ${response.status}${payload?.code ? ` code ${payload.code}` : ''}: ${payload?.message ?? ''}）`)
+      }
+      lastId = typeof payload?.id === 'string' && payload.id !== '' ? payload.id : `qq:${target}:${seq}`
+    }
+    return lastId
   }
 
   /** 互动事件回执（PUT /interactions/{id}，50QPS）：3 秒窗口内告知平台已受理，
@@ -418,7 +693,7 @@ export function createQqInbound(options = {}) {
   async function ackInteraction(interactionId) {
     if (fetchImpl === undefined) return
     const token = await tokens.get()
-    await fetchImpl(`${apiBase}/interactions/${encodeURIComponent(interactionId)}`, {
+    await fetchWithTimeout(`${apiBase}/interactions/${encodeURIComponent(interactionId)}`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
       body: JSON.stringify({ code: 0 }),
@@ -432,13 +707,16 @@ export function createQqInbound(options = {}) {
     await rateGate.gate()
     const target = String(chatId)
     const seq = (msgSeqs.get(target) ?? 0) + 1
-    msgSeqs.set(target, seq)
+    setBounded(msgSeqs, target, seq, CHAT_STATE_MAX, onEvict)
     const kind = targetKindOf(target)
     const url = kind === 'group'
       ? `${apiBase}/v2/groups/${target}/messages`
       : `${apiBase}/v2/users/${target}/messages`
-    const body = { msg_type: 2, msg_seq: seq, markdown: { content: String(markdownContent).slice(0, 3000) }, keyboard }
-    const response = await fetchImpl(url, {
+    // Markdown+键盘是单张卡片：超长只按码点截断（取首块），不拆多卡——键盘必须与卡片
+    // 同体，拆卡会重复按钮/permission；码点截断同样不产生孤立代理项（G-22 同根）。
+    const markdownText = splitByCodePoints(String(markdownContent ?? ''), QQ_MARKDOWN_MAX_CODEPOINTS)[0] ?? ''
+    const body = { msg_type: 2, msg_seq: seq, markdown: { content: markdownText }, keyboard }
+    const response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `QQBot ${token}` },
       body: JSON.stringify(body),
@@ -452,6 +730,7 @@ export function createQqInbound(options = {}) {
 
   return {
     channel: 'qq',
+    accountId: String(config?.appId ?? ''),
     // v0.8.4：按钮化落地（发送失败自动降级文本，capabilities 仅影响文案分流）
     capabilities: { buttons: true },
 
@@ -479,6 +758,11 @@ export function createQqInbound(options = {}) {
       try { await startPromise } catch { /* 启动失败不影响停止 */ }
       if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null }
       cleanupSocket()
+      // Issue #23：stop 后复位全部连接级心跳运行态，保证 restart 能重新正常握手与起搏。
+      heartbeatArmed = false
+      heartbeatIntervalMs = null
+      awaitingAck = false
+      missedAcks = 0
       startPromise = null
     },
 
@@ -497,20 +781,23 @@ export function createQqInbound(options = {}) {
 
     /** 推审批通知（v0.8.4）：优先 markdown+内嵌键盘——两颗回调按钮（type 1）action.data
      *  携带契约协议「ap:<decision>:<approvalKey>:<token>」，click_limit=1 防重复，
-     *  单聊场景 permission 锁定接收人。发送失败自动降级文本编号回复（无感切换）。 */
+     *  permission: { type: 2 }（对齐腾讯 dsh-qqbot approval-renderer.ts，无 specify_user_ids
+     *  ——#26 移除未经证实的 provider 字段；权限已在 Control Core 的 token/account/user/chat
+     *  + pending + 一次性裁决完成）。发送失败自动降级文本编号回复（无感切换）。 */
     async sendApprovalCard({ chatId, title, content, approvalKey, token }) {
       if (typeof approvalKey === 'string' && approvalKey !== '' && typeof token === 'string' && token !== '') {
         try {
           const isUserTarget = targetKindOf(chatId) === 'user'
+          if (!isUserTarget) throw new Error('群聊审批仅提供文本回退，禁止可见按钮')
           const button = (id, label, visitedLabel, style, decision) => ({
             id,
-            render_data: { label, visited_label: visitedLabel, style },
+            render_data: { label: clampButtonLabel(label), visited_label: clampButtonLabel(visitedLabel), style },
             action: {
               // type 必须 1（回调按钮：点击产生 INTERACTION_CREATE 推送到本网关）。
               // type 2 是「指令按钮」——客户端会把 data 当文本消息自动发出，不产生
               // 回调事件（2026-08-23 实测踩坑：官方 overview 示例的 type:2 是指令语义）。
               type: 1,
-              ...(isUserTarget ? { permission: { type: 2, specify_user_ids: [String(chatId)] } } : {}),
+              permission: { type: 2 },
               click_limit: 1,
               data: buildApprovalAction(decision, approvalKey, token),
             },
@@ -519,13 +806,13 @@ export function createQqInbound(options = {}) {
             content: {
               rows: [
                 { buttons: [
-                  button('btn_approve', '✅ 批准', '已批准', 1, 'allowed-once'),
-                  button('btn_reject', '❌ 拒绝', '已拒绝', 2, 'rejected'),
+                  button('btn_approve', t.approveLabel, t.approveVisited, 1, 'allowed-once'),
+                  button('btn_reject', t.rejectLabel, t.rejectVisited, 2, 'rejected'),
                 ] },
               ],
             },
           }
-          const markdown = `${title}\n${content}\n\n点击按钮完成裁决${isUserTarget ? '（仅你本人可点）' : ''}：`
+          const markdown = `${title}\n${content}\n\n${t.markdownFooter(isUserTarget)}`
           const messageId = await postMarkdownWithKeyboard(chatId, markdown, keyboard)
           if (messageId !== null) return { messageId }
         } catch (error) {
@@ -533,7 +820,7 @@ export function createQqInbound(options = {}) {
         }
       }
       try {
-        const text = `${title}\n${content}\n\n回复 1 批准 / 2 拒绝`
+        const text = STRINGS.approval.fallbackText(title, content)
         const messageId = await postMessage(chatId, text)
         return messageId !== null ? { messageId } : null
       } catch (error) {
@@ -542,46 +829,20 @@ export function createQqInbound(options = {}) {
       }
     },
 
-    /** 推提问卡片（v0.8 sendQuestionCard 契约实现）：markdown 选项清单 + 每项一枚
-     *  回调按钮（aq:<qKey>:<idx>:<token>，P7 载荷不带选项文本）+ 尾行「跳过/自定义」。
-     *  多选场景点按钮=单选提交（组合选择走「1,3」编号文本）；自定义回答走「答：内容」
-     *  文本前缀（按钮只作教学）。失败抛错由 normalizeInbound 归一 null → 编号兜底。 */
-    async sendQuestionCard({ chatId, title, content, qKey, token, options, multiSelect }) {
-      const opts = Array.isArray(options) ? options.map((label) => String(label)) : []
-      if (opts.length === 0) return null
+    async sendQuestionCard({ chatId, title, content, qKey, token, options = [] }) {
       try {
         const isUserTarget = targetKindOf(chatId) === 'user'
-        const actionButton = (id, label, visitedLabel, style, optIdx) => ({
-          id,
-          render_data: { label, visited_label: visitedLabel, style },
-          action: {
-            type: 1,
-            ...(isUserTarget ? { permission: { type: 2, specify_user_ids: [String(chatId)] } } : {}),
-            click_limit: 1,
-            data: buildQuestionAction(qKey, optIdx, token),
-          },
-        })
-        const rows = opts.slice(0, 5).map((label, idx) => ({
-          buttons: [actionButton(`q_opt_${idx}`, `${idx + 1}. ${label.slice(0, 12)}`, '已作答', 0, String(idx))],
+        if (!isUserTarget) return null // 群聊不展示可操作提问卡，避免成员间信息/权限泄漏
+        const buttons = options.slice(0, 5).map((label, index) => ({
+          id: `q_${index}`,
+          render_data: { label: clampButtonLabel(`${index + 1}. ${String(label)}`), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+          action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, String(index), token) },
         }))
-        rows.push({
-          buttons: [
-            actionButton('q_skip', '⏭ 跳过', '已跳过', 2, 's'),
-            actionButton('q_custom', '✍️ 自定义', '见说明', 0, 'c'),
-          ],
-        })
-        const markdown = [
-          title,
-          content,
-          '',
-          ...opts.map((label, idx) => `${idx + 1}. ${label}`),
-          multiSelect === true ? '（多选题：点按钮=提交单选；组合选择请回复编号如 1,3）' : '',
-          '自定义回答：回复「答：<你的回答>」',
-        ].filter((line) => line !== '').join('\n')
-        const messageId = await postMarkdownWithKeyboard(chatId, markdown, { content: { rows } })
-        return messageId !== null ? { messageId } : null
+        buttons.push({ id: 'q_custom', render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 }, action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) } })
+        const messageId = await postMarkdownWithKeyboard(chatId, `${title}\n${content}`, { content: { rows: buttons.map((button) => ({ buttons: [button] })) } })
+        return messageId === null ? null : { messageId }
       } catch (error) {
-        warn(`提问卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)
+        warn(`提问卡片发送失败，降级编号: ${error instanceof Error ? error.message : String(error)}`)
         return null
       }
     },
@@ -590,7 +851,7 @@ export function createQqInbound(options = {}) {
     async editResolved(target, text) {
       if (target?.chatId === undefined || String(target.chatId) === '') return
       try {
-        await postMessage(target.chatId, `[审批结果] ${text}`)
+        await postMessage(target.chatId, t.resultLine(text))
       } catch (error) {
         warn(`审批结果回执失败: ${error instanceof Error ? error.message : String(error)}`)
       }

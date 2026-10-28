@@ -17,17 +17,32 @@
 //     绝不让底层异常裸穿到 HTTP 层；
 //   - 动作方法（testChannel/scanChannel）能力不可用抛 ApiError(501)，可用则结果原样透传；
 //   - 审计（<stateDir>/admin-audit.jsonl，append-only，§5「谁改了什么」）失败只 warn，
-//     绝不影响主流程。
+//     绝不影响主流程（appendAudit 内部吞错 + 各调用点 auditGuard 兜底双保险，G-05）。
 
 import { appendFileSync, chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from 'node:fs'
+import { createLog } from '../log.mjs'
 import { dirname, join } from 'node:path'
-import { CHANNEL_TYPES, channelFieldsOf } from '../config.mjs'
+import { CHANNEL_TYPES, channelFieldsOf, channelFixedOptions, channelDocUrlOf } from '../config.mjs'
+import { INBOUND_CHANNELS, INBOUND_CHANNEL_SET } from '../inbound/channels-registry.mjs'
+import { createInboundChannelConfigPort, INBOUND_FIELDS, describeBadChannelValue, inboundKeyWhitelist } from '../inbound/channel-config.mjs'
+import { tasksSnapshot } from '../routing/task-projection.mjs'
+import { createHostCapabilitySnapshot } from '../host/capability.mjs'
+import { deleteDurable, setDurable } from '../inbound/store.mjs'
+import { isPublicExposure } from '../security/exposure.mjs'
+import { diagnosticErrorMessage, redactDiagnosticValue } from '../security/diagnostic.mjs'
+import { splitSecretPatch } from '../security/secret-patch.mjs'
+import {
+  CONTROL_OVERLAY_MAX_MEMBERS,
+  CONTROL_OVERLAY_MAX_STRING,
+  isGlobalControlValue,
+} from '../control/session-arbiter.mjs'
 
 /**
- * 入站通道全集（与 inbound 装配一一对应；出站全集 = config.mjs 的 CHANNEL_TYPES）。
- * 逐字契约：server.mjs / ui.mjs 按此并行开发，勿改顺序与成员。
+ * 入站通道全集（单一事实来源 channels-registry；与 inbound 装配一一对应，
+ * 出站全集 = config.mjs 的 CHANNEL_TYPES）。逐字契约：server.mjs / ui.mjs 按此
+ * 并行开发，勿改顺序与成员——清单本体在 registry，本文件只转发导出。
  */
-export const INBOUND_CHANNELS = ['telegram', 'feishu', 'qq', 'wxpusher', 'wechat', 'dingtalk']
+export { INBOUND_CHANNELS } from '../inbound/channels-registry.mjs'
 
 /**
  * 双域冲突通道：既是出站 webhook 渠道（webhook/secret）又是入站机器人渠道
@@ -67,7 +82,7 @@ const DEFAULT_STATE_DIR = './state'
 
 /** 出站/入站通道集合（includes 判定用 Set，避免每行 O(n) 扫描）。 */
 const OUTBOUND_SET = new Set(CHANNEL_TYPES)
-const INBOUND_SET = new Set(INBOUND_CHANNELS)
+const INBOUND_SET = INBOUND_CHANNEL_SET
 
 /** 取「普通对象」：null / 数组 / 标量一律视为无条目（手工编辑或损坏数据防御）。 */
 function plainObjectOf(value) {
@@ -85,39 +100,100 @@ function deepCopyPlain(value) {
 }
 
 /**
+ * 会话控制覆盖层的**安全脱敏摘要**（getSessions 行 / patchSessionControl 返回值用）。
+ * 只暴露 mode / approvalOwnerOnly / ownerConfigured / approvalMembersCount——绝不回显任何
+ * 原始 owner、成员 channel/accountId/userId 标识（credential/identifier 零泄漏；token 与完整
+ * 身份从不进入任何 API 响应）。覆盖层缺失或损坏时返回 undefined（行内省略该键）。
+ * @param {unknown} control - route:sessions[id].control 原始值。
+ * @returns {{mode?: string, approvalOwnerOnly?: boolean, ownerConfigured?: boolean,
+ *   approvalMembersCount?: number} | undefined}
+ */
+function controlSummary(control) {
+  const raw = plainObjectOf(control)
+  if (raw === null || Object.keys(raw).length === 0) return undefined
+  const summary = {}
+  if (raw.mode === 'team' || raw.mode === 'personal') summary.mode = raw.mode
+  if (typeof raw.approvalOwnerOnly === 'boolean') summary.approvalOwnerOnly = raw.approvalOwnerOnly
+  if (typeof raw.owner === 'string' && raw.owner !== '') summary.ownerConfigured = true
+  if (Array.isArray(raw.approvalMembers)) summary.approvalMembersCount = raw.approvalMembers.length
+  return Object.keys(summary).length > 0 ? summary : undefined
+}
+
+/**
  * v0.7 成员复合键 "<channel>:<userId>" 解析（管理台路由用）。
  * userId 内含冒号也容忍（只按第一个冒号切）；渠道必须属六入站通道，userId 非空且 ≤128。
- * @returns {{ channel: string, userId: string, raw: string } | null} 非法形状返回 null
+ *
+ * C3 审查（v0.8.7）：这里**故意不拒**含冒号的 userId。C3 的纵深防御设在「写入面」
+ * （identity.addBinding/addPending + wxpusher UID_PATTERN 已 fail-closed，新的冒号
+ * 身份再也进不来），而本函数只服务四条**读改删**路由（PUT 改角色 / DELETE 删成员 /
+ * confirm / dismiss）。若在此一并拒收，C3 之前落盘的存量冒号绑定行（旧 wxpusher
+ * UID_PATTERN 放行冒号 → addBinding 直落 `wxpusher:UID:EVIL`）仍会照常准入放行，却
+ * 再也无法经管理台降级或删除——等于把一条越权身份永久钉死在白名单里（违反宪法 #7
+ * 「fail-open 要有度」的反面：过度收紧反而锁死唯一清理入口）。confirm 路径不构成
+ * 提权面：confirmPending 末端仍走 addBinding，冒号 userId 在那里被拒。
+ * @returns {{ channel: string, accountId?: string, userId: string, raw: string } | null} 非法形状返回 null
  */
-const MEMBER_KEY_HINT = '成员键形状：<channel>:<userId>（channel ∈ telegram/feishu/qq/wxpusher/wechat/dingtalk）'
+const MEMBER_KEY_HINT = '成员键形状：<channel>:<userId> 或 <channel>:<accountId>:<userId>（channel ∈ telegram/feishu/qq/wxpusher/wechat/dingtalk）'
 function parseMemberKey(key) {
   const raw = String(key ?? '').trim()
   const colon = raw.indexOf(':')
   if (colon <= 0) return null
   const channel = raw.slice(0, colon)
-  const userId = raw.slice(colon + 1)
+  const remainder = raw.slice(colon + 1)
+  const parts = remainder.split(':')
+  const accountId = parts.length >= 2 ? parts[0] : undefined
+  const userId = parts.length >= 2 ? parts.slice(1).join(':') : remainder
   if (!INBOUND_SET.has(channel)) return null
-  if (userId === '' || userId.length > 128) return null
-  return { channel, userId, raw }
+  if (userId === '' || userId.length > 128 || (accountId !== undefined && (accountId === '' || accountId.length > 128))) return null
+  return { channel, ...(accountId === undefined ? {} : { accountId }), userId, raw }
+}
+
+function memberKeyOf(record) {
+  if (record?.accountId !== undefined && String(record.accountId) !== '') {
+    return `${record.channel}:${record.accountId}:${record.userId}`
+  }
+  return `${record?.channel}:${record?.userId}`
+}
+
+function resolveMemberRecord(identity, parsed, pending = false) {
+  const records = pending ? identity.listPending() : identity.list(parsed.channel)
+  return records.find((record) => memberKeyOf(record) === parsed.raw)
 }
 
 /** 错误 → 可读消息（日志与审计用）。 */
-const errorMessage = (error) => (error instanceof Error ? error.message : String(error))
+const errorMessage = (error) => diagnosticErrorMessage(error)
 
 /**
  * 深遍历脱敏（getChannels 用；比 config.mjs 的 maskChannelConfig 更激进——管理台凭证表单
  * 不区分 secret 字段，凡字符串值一律不可回显）：字符串值（含嵌套对象/数组里的）替换为
  * '***'，键名与非字符串值（数字/布尔/null）原样保留。
+ * plainKeys（仅顶层生效）里的键跳过脱敏——fields 声明 plain: true 的非秘密枚举字段
+ * （如 wps-bot msgtype）明文回显，脱敏成 *** 反而让用户以为配置丢了。
+ * 递归层不传 plainKeys：明文豁免只作用于 config 顶层键，嵌套同名键照常脱敏。
  */
-function maskSecrets(value) {
+function maskSecrets(value, plainKeys) {
   if (typeof value === 'string') return '***'
-  if (Array.isArray(value)) return value.map(maskSecrets)
+  if (Array.isArray(value)) return value.map((item) => maskSecrets(item))
   if (plainObjectOf(value) !== null) {
     const out = {}
-    for (const [key, item] of Object.entries(value)) out[key] = maskSecrets(item)
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = plainKeys !== undefined && plainKeys.has(key) ? item : maskSecrets(item)
+    }
     return out
   }
   return value
+}
+
+/**
+ * 某通道的明文回显键集合（fields 声明 plain === true 的键，如 wps-bot msgtype）。
+ * 手写渠道与入站字段表无 plain 声明 → 空集（行为不变）。
+ */
+function plainFieldsOf(type) {
+  const out = new Set()
+  for (const [key, field] of Object.entries(channelFieldsOf(type))) {
+    if (plainObjectOf(field)?.plain === true) out.add(key)
+  }
+  return out
 }
 
 /** lastActiveAt → 毫秒时间戳（数字/ISO 字符串；缺失或非法视为 0，排序兜底）。 */
@@ -128,27 +204,6 @@ function lastActiveMs(value) {
     if (Number.isFinite(ms)) return ms
   }
   return 0
-}
-
-/** 入站通道的凭证字段表（管理台表单渲染用；wechat 为 iLink 登录态扫码产物，不手填）。 */
-const INBOUND_FIELDS = {
-  telegram: { botToken: { required: true, desc: 'Telegram Bot Token（与出站同域）' } },
-  feishu: {
-    appId: { required: true, desc: '飞书自建应用 App ID（扫码授权自动写入）' },
-    appSecret: { required: true, desc: '飞书自建应用 App Secret（扫码授权自动写入）' },
-  },
-  qq: {
-    appId: { required: true, desc: 'QQ 机器人 AppID（扫码授权自动写入）' },
-    appSecret: { required: true, desc: 'QQ 机器人 AppSecret（扫码授权自动写入）' },
-  },
-  wxpusher: {
-    appToken: { required: true, desc: 'WxPusher 应用 APP_TOKEN（回调鉴权即凭证）' },
-  },
-  wechat: {},
-  dingtalk: {
-    appKey: { required: true, desc: '钉钉企业内部应用 AppKey（扫码授权自动写入）' },
-    appSecret: { required: true, desc: '钉钉企业内部应用 AppSecret（扫码授权自动写入）' },
-  },
 }
 
 /**
@@ -177,22 +232,21 @@ const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 function channelKeyWhitelist(type) {
   const keys = new Set()
   if (DUAL_INBOUND_DOMAIN.has(type)) {
-    for (const key of Object.keys(INBOUND_FIELDS[type] ?? {})) keys.add(key)
+    for (const key of inboundKeyWhitelist(type)) keys.add(key)
     return keys
   }
   if (OUTBOUND_SET.has(type)) {
     for (const key of Object.keys(channelFieldsOf(type))) keys.add(key)
-    for (const key of COMMON_ENDPOINT_KEYS) keys.add(key)
+    // fixedOptions 渠道（wps-bot）不暴露 timeoutMs/apiBase 引擎级调优键——
+    // resolve 层本就忽略（引擎 fixedOptions 语义），白名单同步收窄防写入死配置。
+    if (!channelFixedOptions(type)) {
+      for (const key of COMMON_ENDPOINT_KEYS) keys.add(key)
+    }
   }
   if (INBOUND_SET.has(type)) {
-    for (const key of Object.keys(INBOUND_FIELDS[type] ?? {})) keys.add(key)
+    for (const key of inboundKeyWhitelist(type)) keys.add(key)
   }
   return keys
-}
-
-/** 单值字节数（字符串按 UTF-8 计）。 */
-const valueBytes = (value) => {
-  try { return Buffer.byteLength(value, 'utf8') } catch { return Infinity }
 }
 
 /**
@@ -202,35 +256,6 @@ const valueBytes = (value) => {
  * @param {unknown} value
  * @returns {string | null} 首个违规的中文错误消息；合法返回 null。
  */
-function describeBadChannelValue(key, value) {
-  if (typeof value === 'string') {
-    if (valueBytes(value) > MAX_VALUE_BYTES) return `"${key}" 超过 ${MAX_VALUE_BYTES} 字节上限`
-    return null
-  }
-  if (typeof value === 'number') return Number.isFinite(value) ? null : `"${key}" 必须是有限数字`
-  if (typeof value === 'boolean') return null
-  if (Array.isArray(value)) {
-    if (value.length > MAX_CHANNEL_KEYS) return `"${key}" 数组超过 ${MAX_CHANNEL_KEYS} 项上限`
-    for (const item of value) {
-      const bad = describeBadChannelValue(key, item)
-      if (bad !== null) return bad
-    }
-    return null
-  }
-  const obj = plainObjectOf(value)
-  if (obj !== null) {
-    const entries = Object.entries(obj)
-    if (entries.length > MAX_CHANNEL_KEYS) return `"${key}" 对象超过 ${MAX_CHANNEL_KEYS} 键上限`
-    for (const [subKey, item] of entries) {
-      if (DANGEROUS_KEYS.has(subKey)) return `"${key}" 内含保留键 "${subKey}"`
-      const bad = describeBadChannelValue(`${key}.${subKey}`, item)
-      if (bad !== null) return bad
-    }
-    return null
-  }
-  return `"${key}" 的值必须是字符串/数字/布尔/数组/对象`
-}
-
 /**
  * 创建 Web 管理台 API 实例（server.mjs 按方法名调用；全部依赖可缺省）。
  *
@@ -249,8 +274,14 @@ function describeBadChannelValue(key, value) {
  *   出站渠道配置表（type → resolved config，装配层注入 resolved.channels 快照）；
  *   getChannels 出站行展示「YAML ⊕ store 账号」合并视图（store 字段覆盖同名 YAML 字段）；
  *   缺省/抛错按无 YAML 配置降级（store 账号独立成视图）
- * @param {(type: string) => Promise<object>} [options.channelTest] - 单渠道连通性自检
- *   （装配层注入，如 health/self-check 包装）；缺省时 testChannel 抛 501
+ * @param {() => Record<string, object>} [options.yamlRawConfigs] - 零配置首访：YAML 原始
+ *   出站行表（type → raw row，未 resolve、含 ${ENV:NAME} 原文）。testOutboundChannel 的
+ *   合并基底——即时测试必须走「当前 YAML 原文 + 当前 state 出站键」重新 resolve，
+ *   不能用启动快照或已 resolve 配置二次 resolve（幂等性无保证）。缺省时回落 outboundConfigs。
+ * @param {(type: string, rawConfig?: object) => Promise<object>} [options.channelTest] - 单渠道
+ *   连通性自检（装配层注入，如 health/self-check 包装）；缺省时 testChannel 抛 501。
+ *   零配置首访起支持可选第二参 rawConfig（testOutboundChannel 现场合并结果）；
+ *   省略时由装配层回落启动快照（旧 testChannel 行为不变）。
  * @param {Record<string, () => Promise<{qrContent, done, saved?}>>} [options.scanHandlers] -
  *   各入站通道的网页扫码处理器（装配层保证形状）；无对应通道处理器时 scanChannel 抛 501
  * @param {object} [options.identity] - v0.7 身份绑定层实例（src/inbound/identity.mjs）；
@@ -258,27 +289,36 @@ function describeBadChannelValue(key, value) {
  *   缺失时成员查询按空表降级、成员写方法抛 501（能力不可用）
  * @param {object} [options.pairing] - v0.7 配对码状态机实例（src/inbound/pairing.mjs）；
  *   缺失时配对码查询按空表降级、铸造/撤销抛 501
+ * @param {object} [options.questions] - 问题桥（src/questions/router.mjs 的 createQuestionBridge
+ *   返回面）带 `adminPending()`/`adminSettle()` facade；缺省时待决查询按空表降级、
+ *   结算抛 501（能力不可用）
+ * @param {object} [options.control] - Control Core（src/control/entry.mjs createControlEntry）；
+ *   结算必须经其唯一裁决；缺省 + questions 存在视为未接线 → 结算 fail-closed 501，绝不直通
  * @param {() => boolean} [options.guidedProbe] - v0.7 引导态探针（与 bus.isGuided 同口径：
  *   绑定表空 + allowUsers 空）；缺省按非引导态展示
  * @param {string} [options.stateDir] - 审计文件目录（缺省回落 './state'；测试注入临时目录）
  * @param {object} [options.logger] - cordis logger（warn 用）；缺省静默
  * @returns {object} API 实例：overview/getBindings/putBindings/getSessions/patchSession/
  *   getChannels/putChannel/testChannel/scanChannel/getMembers/putMember/deleteMember/
- *   confirmPendingMember/dismissPendingMember/mintPairingCode/revokePairingCode/getAudit
- *   （appendAudit 为内部函数不外露）
+ *   confirmPendingMember/dismissPendingMember/mintPairingCode/revokePairingCode/getAudit/
+ *   getPendingQuestions/settleQuestion
+ *   （appendAudit 门面供 pairing 等外部子系统落审计；本文件内部调用点一律走
+ *   auditGuard 兜底——审计失败绝不改变主流程返回值，G-05）
  */
 export function createAdminApi(options = {}) {
   const {
-    router, registry, store, notifier, channelsEnabled, outboundConfigs, channelTest, scanHandlers,
-    identity, pairing, guidedProbe = null, stateDir, logger,
+    router, registry, store, notifier, channelsEnabled, outboundConfigs, outboundConfig = null, channelTest, scanHandlers,
+    identity, pairing, guidedProbe = null, stateDir, logger, questions = null, control = null,
+    yamlRawConfigs = null,
+    // v0.10 提交7「管理台暴露 DSH 连接与任务状态」：宿主上下文 + 任务投影注入 + 宿主
+    // 能力快照注入（全部只读；缺失一律安全降级，绝不抛）。
+    ctx = null, attentionOf = null, hostSnapshot = null,
+    questionsFallbackEnabled = false, webLocal = 'unknown', imageInput = 'unknown', inboundConfig = null,
   } = options ?? {}
 
-  const warn = (message) => {
-    // stderr 双写（R5 审查 R5-2-P1-2：v0.6.1 可见性事故后 inbound 全家已双写，admin 层漏跟——
-    // dsh web profile 下 logger 不落 stdout，成员读失败降级/mint 500 兜底全部零可见）
-    try { logger?.warn?.('[dsh-notifier/admin-api]', message) } catch { /* 日志失败绝不致命 */ }
-    try { console.error('[dsh-notifier/admin-api]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+  const log = createLog({ logger, tag: '[dsh-notifier-gate/admin-api]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   // ---- store 防御壳：方法缺失/抛错一律按「无此数据」处理，绝不外泄 ----
   const safeGet = (key, fallback = undefined) => {
@@ -315,6 +355,32 @@ export function createAdminApi(options = {}) {
     }
   }
 
+  /**
+   * YAML 原始出站行表（type → raw row，未 resolve）：testOutboundChannel 合并基底。
+   * 注入缺失/抛错时回落 yamlOutboundOf()（已 resolve 配置二次 resolve 是降级路径，
+   * 适配器 resolve 对幂等输入宽容；装配层生产路径恒注入 raw 行）。
+   */
+  const yamlRawOf = () => {
+    try {
+      const table = typeof yamlRawConfigs === 'function' ? yamlRawConfigs() : null
+      if (table !== null) return plainObjectOf(table) ?? {}
+    } catch { /* 注入失败走回落 */ }
+    return yamlOutboundOf()
+  }
+
+  /** v0.13 production path delegates outbound truth to the shared service. */
+  const serviceRawOf = (type) => {
+    try { return plainObjectOf(outboundConfig?.raw?.(type)) ?? {} } catch { return {} }
+  }
+  const serviceDescribeOf = (type) => {
+    try { return plainObjectOf(outboundConfig?.describe?.(type)) ?? {} } catch { return {} }
+  }
+  /** v0.12 direct API compatibility path when no shared service is injected. */
+  const hasAdminOutbound = (type) => outboundConfig !== null
+    ? serviceDescribeOf(type).configured === true
+      || Object.keys(serviceRawOf(type)).length > 0
+    : safeGet(`channel:${type}:outbound`) !== undefined || safeGet(`admin:channel:${type}:outbound`) !== undefined
+
   /** registry.isActive 防御包装：缺失/抛错一律 false。 */
   const isActiveOf = (id) => {
     try { return typeof registry?.isActive === 'function' ? registry.isActive(id) === true : false } catch { return false }
@@ -342,7 +408,7 @@ export function createAdminApi(options = {}) {
           renameSync(auditFile, `${auditFile}.1`)
         }
       } catch { /* stat 失败（文件尚不存在等）：跳过轮转直接 append */ }
-      appendFileSync(auditFile, `${JSON.stringify({ time: new Date().toISOString(), action, detail })}\n`, 'utf8')
+      appendFileSync(auditFile, `${JSON.stringify({ time: new Date().toISOString(), action, detail: redactDiagnosticValue(detail) })}\n`, 'utf8')
       // v0.6.3：对齐 store 的 0600 军规（审查 R3 P2-2）——审计含 session id 与绑定键。
       try { chmodSync(auditFile, 0o600) } catch { /* Windows/受限环境无 chmod */ }
     } catch (error) {
@@ -351,12 +417,34 @@ export function createAdminApi(options = {}) {
   }
 
   /**
+   * G-05（2026-08-28）：内部审计统一兜底入口，本文件所有 appendAudit 调用点一律经此。
+   * appendAudit 自身虽已吞错（磁盘满/权限异常只 warn），但调用点控制流同样不得依赖
+   * 审计成功——状态写入/裁决已生效的事实不能被可观测性副作用翻成异常：HTTP 层会把
+   * 裸异常映射 500，前端引导重试，重试命中 already-handled 再报错，内外状态认知分叉。
+   * 经 api.appendAudit 门面调用（与 pairing 等外部子系统同一入口，宿主/测试可整体替换
+   * 审计后端；api 在下方声明，本函数只在方法调用期执行，届时必已初始化）。任何抛错 →
+   * warn（stderr + host logger 双出口）后继续，绝不改变主流程返回值；各调用点各自经
+   * 此入口独立兜底，互不牵连。取舍：该次审计行缺失，降级以 warn 留痕换取结果如实。
+   */
+  const auditGuard = (action, detail) => {
+    try {
+      api.appendAudit(action, detail)
+    } catch (error) {
+      warn(`审计写入失败（action=${String(action ?? 'unknown')}，主流程结果不受影响）: ${errorMessage(error)}`)
+    }
+  }
+
+  // v0.12.1（P1-03）：Admin 与 Native 共用同一入站配置端口，端口本身不依赖 Admin 生命周期。
+  const inboundPort = inboundConfig ?? createInboundChannelConfigPort({ store, warn, audit: auditGuard })
+
+  /**
    * 通道行全集（overview 与 getChannels 共用）：出站 = CHANNEL_TYPES 全量 + 入站 =
    * INBOUND_CHANNELS 全量（telegram/feishu 等双向通道各出一行，direction 区分）。
    * 出行 enabled = channelsEnabled() 含 type；configured = enabled 或 store 有
-   * `<type>:account`（YAML 未配但 store 账号在也叫已配置——下次启动 overlay 即生效）；
-   * 但双域通道（feishu/dingtalk）的 `<type>:account` 是入站机器人凭证，出站行只认
-   * YAML（configured = enabled），且 editable=false（出站 webhook 走 YAML bootstrap）。
+   * `admin:channel:<type>:outbound`（零配置首访键域）或非双域的旧 `<type>:account`。
+   * 零配置首访起双域通道（feishu/dingtalk）出站也可网页编辑——新出站键与入站
+   * `<type>:account` 键域分离，editable 恒 true（旧 putChannel 的 webhook 422 限制
+   * 只约束旧路由，新方向路由不受此限）。
    * 入行 configured = store 有 `<channel>:account`（v0.3.1 扫码落盘域），editable 恒 true。
    */
   function channelRows() {
@@ -368,14 +456,34 @@ export function createAdminApi(options = {}) {
       rows.push({
         type,
         direction: 'outbound',
-        configured: dual ? isEnabled : (hasAccount(type) || isEnabled),
+        configured: isEnabled || hasAdminOutbound(type) || (outboundConfig === null && !dual && hasAccount(type)),
         enabled: isEnabled,
-        editable: !dual,
+        editable: true,
+        // v0.12.1（P1-05）：这里的 restartRequired 描述 Admin legacy <type>:account
+        // 写入域；该域只在插件下次启动时并入运行时。Native canonical 出站域是 Hot Apply，
+        // 由 src/control-surface/apply-mode.mjs 单独回答，不能用本字段反推。
+        restartRequired: true,
       })
     }
+    // v0.13（C11.5 / R6）：入站行必须区分配置（desired）与运行时（runtime）。此前
+    // enabled/configured 直接冒充「已生效」，且 restartRequired 恒 false 也在撒谎——
+    // 入站凭证只在下次启动才并入 transport（applyMode=restart）。active 由 inboundPort
+    // 注入的薄聚合 runtime 真值回答，拿不到就是 false（绝不 configured → active）。
+    const inboundByType = new Map((() => {
+      try { return typeof inboundPort?.rows === 'function' ? inboundPort.rows() : [] } catch { return [] }
+    })().map((row) => [row.type, row]))
     for (const channel of INBOUND_CHANNELS) {
       const configured = hasAccount(channel)
-      rows.push({ type: channel, direction: 'inbound', configured, enabled: configured, editable: true })
+      const inRow = inboundByType.get(channel)
+      rows.push({
+        type: channel,
+        direction: 'inbound',
+        configured,
+        enabled: configured,
+        active: inRow?.active === true,
+        editable: true,
+        restartRequired: inRow?.restartRequired !== false,
+      })
     }
     return rows
   }
@@ -394,13 +502,15 @@ export function createAdminApi(options = {}) {
   // getAudit()/getBindings()（与 CLI/HTTP 层走完全相同的读取路径）。
   const api = {
     /**
-     * Dashboard 总览：通道健康矩阵（出站 + 入站全量行）+ 会话计数 + agent 路由键数 + 最近审计。
+     * Dashboard 总览：通道健康矩阵（出站 + 入站全量行）+ 会话计数 + agent 路由键数 +
+     *   成员计数（引导态）+ 最近审计。
      * @returns {{ channels: Array<{type: string, direction: 'outbound'|'inbound',
      *   configured: boolean, enabled: boolean}>,
      *   sessions: { active: number, total: number }, agents: { keys: number },
+     *   members: { total: number, owners: number, guided: boolean },
      *   audit: Array<{time: string, action: string, detail: object}> }}
      *   sessions.total = route:sessions 表条目数（含已 dispose 未回收）；active = registry
-     *   判活跃数；audit = 最近 20 条新在前。
+     *   判活跃数；members.guided = 无成员即引导态；audit = 最近 20 条新在前。
      */
     overview() {
       const sessionIds = Object.keys(readTable(KEY_SESSIONS))
@@ -410,11 +520,71 @@ export function createAdminApi(options = {}) {
       }
       let agentKeys = 0
       try { agentKeys = typeof router?.listAgentKeys === 'function' ? router.listAgentKeys().length : 0 } catch { agentKeys = 0 }
+      // 成员计数（identity 未装配时回落 0 / guided=true，与成员页引导态口径一致）
+      let memberTotal = 0
+      let memberOwners = 0
+      let guided = true
+      try {
+        if (identity !== null && typeof identity.list === 'function') {
+          const all = identity.list()
+          memberTotal = all.length
+          memberOwners = all.filter((r) => r?.role === 'owner').length
+          guided = memberTotal === 0
+        }
+      } catch { /* 读失败按引导态处理，不影响总览 */ }
       return {
         channels: channelRows(),
         sessions: { active, total: sessionIds.length },
         agents: { keys: agentKeys },
+        members: { total: memberTotal, owners: memberOwners, guided },
         audit: api.getAudit().slice(0, 20),
+      }
+    },
+
+    // ---------- v0.10 提交7：管理台暴露 DSH 连接与任务状态 ----------
+    /**
+     * 任务状态只读快照（管理台 /tasks 数据源；与手机 /tasks、歧义选择卡同一投影源）。
+     * 单条仅含 { taskRef, workspace, status, attention, lastActivityAt, boundChannels }——
+     * 无正文 / 凭证 / 回答 / 绑定身份（task-projection 冻结的红线）。查询绝不抛。
+     * @returns {{ count: number, activitySorted: boolean, tasks: Array<object> }}
+     */
+    getTasks() {
+      try {
+        return tasksSnapshot({
+          registry,
+          router,
+          ctx,
+          channelTypes: enabledTypes(),
+          attentionOf,
+        })
+      } catch {
+        // 投影层按字段逐一降级，理论上不抛；此处是最后一道兜底（宿主对象代理 trap 等极端场景）。
+        return { count: 0, activitySorted: false, tasks: [] }
+      }
+    },
+
+    /**
+     * 宿主（DSH）连接与能力快照（管理台 /host 数据源）：只描述公开 seam 的特性检测
+     * （版本 / 事件模式 / 提问模式 / 会话模式 / 图片入站 / 本机管理台可用），绝不带
+     * sessionId / token / chatId / userId / provider 凭证（capability 冻结的红线）。
+     * hostSnapshot() 提供 registrar.snapshot() 的产物（events/context/scope），缺失按空。
+     * @returns {{ host: object, events: object, questions: object, conversation: object, media: object }}
+     */
+    getHostCapabilities() {
+      const events = (() => {
+        try { return typeof hostSnapshot === 'function' ? hostSnapshot() : null } catch { return null }
+      })()
+      try {
+        return createHostCapabilitySnapshot({
+          ctx,
+          events,
+          questionsFallbackEnabled: questionsFallbackEnabled === true,
+          webLocal,
+          imageInput,
+        })
+      } catch {
+        // 查询方法红线：绝不抛（宿主 ctx 可能是抛错代理/getter）。降级为全 unknown 的安全最小快照。
+        return createHostCapabilitySnapshot({ ctx: {}, events: null })
       }
     },
 
@@ -555,7 +725,7 @@ export function createAdminApi(options = {}) {
         }
       }
 
-      appendAudit('putBindings', {
+      auditGuard('putBindings', {
         agents: nextAgents === null ? null : Object.keys(nextAgents),
         channels: nextChannels === null ? null : Object.keys(nextChannels),
       })
@@ -598,6 +768,8 @@ export function createAdminApi(options = {}) {
         if (rec.disposedAt !== undefined) row.disposedAt = rec.disposedAt
         if (rec.outbound !== undefined) row.outbound = deepCopyPlain(rec.outbound)
         if (rec.inbound !== undefined) row.inbound = deepCopyPlain(rec.inbound)
+        const ctrl = controlSummary(rec.control)
+        if (ctrl !== undefined) row.control = ctrl // Stage 4 安全脱敏覆盖层摘要（绝无原始标识符）
         rows.push(row)
       }
       rows.sort((a, b) => (a.active === b.active
@@ -652,9 +824,122 @@ export function createAdminApi(options = {}) {
       if (!callSetter(router?.setSessionOutbound, id, normalized)) {
         throw new ApiError(500, '会话覆盖写入存储失败')
       }
-      appendAudit('patchSession', { id, diff: normalized })
+      auditGuard('patchSession', { id, diff: normalized })
       const outbound = plainObjectOf(plainObjectOf(readTable(KEY_SESSIONS)[id])?.outbound)
       return { id, outbound: outbound === null ? undefined : deepCopyPlain(outbound) }
+    },
+
+    /**
+     * 写会话控制覆盖层（Stage 4：持久化已评审的 owner / approvalOwnerOnly / approvalMembers）。
+     * 字段级 diff（与 patchSession 同语义）：出现且值为 null 的字段删除（回落 basePolicy），
+     * 出现且非空写入，未出现不动；覆盖层清空即整键移除。
+     *
+     * 校验（失败抛 ApiError(422)，零写入）：未知字段、保留键、以及**任何来源字段**
+     * （channel/accountId/userId/chatId/sessionId/policyVersion/expiresAt/revoked）一律拒绝——
+     * 授权来源只能来自会话真实来源（fail-closed，admin 载荷绝不能铸造 channel/account/user/chat）；
+     * mode 仅 team/personal；owner 非空字符串、≤128、非通配/全局；approvalOwnerOnly 布尔；
+     * approvalMembers 数组 ≤64、每项 { channel, accountId, userId } 全非空≤128 非通配且无未知键。
+     * 会话从未建档 → 404；存储写入失败 → 500。返回脱敏摘要（绝无原始标识符）。
+     *
+     * @param {string} id - 会话 id（=== agent.id）。
+     * @param {{ mode?: string|null, owner?: string|null, approvalOwnerOnly?: boolean|null,
+     *            approvalMembers?: Array<object>|null }} diff - 见字段级语义。
+     * @returns {{ id: string, control?: object }} control = 写后覆盖层的安全脱敏摘要（清空为 undefined）。
+     * @throws {ApiError} 422 入参校验失败；404 会话从未建档；500 存储写入失败。
+     */
+    patchSessionControl(id, diff) {
+      if (typeof id !== 'string' || id.trim() === '') throw new ApiError(422, '会话 id 必须是非空字符串')
+      if (plainObjectOf(diff) === null) {
+        throw new ApiError(422, '请求体必须是对象（{ mode?, owner?, approvalOwnerOnly?, approvalMembers? }）')
+      }
+      const SOURCE_FIELDS = ['channel', 'accountId', 'userId', 'chatId', 'sessionId', 'policyVersion', 'expiresAt', 'revoked']
+      const OVERLAY_FIELDS = ['mode', 'owner', 'approvalOwnerOnly', 'approvalMembers']
+      const normalized = {}
+      for (const key of Object.keys(diff)) {
+        const value = diff[key]
+        if (key === 'mode') {
+          if (value !== null && value !== 'team' && value !== 'personal') {
+            throw new ApiError(422, 'mode 只能是 "team" 或 "personal"（或 null 清除）')
+          }
+          normalized.mode = value === null ? null : value
+        } else if (key === 'owner') {
+          if (value === null) {
+            normalized.owner = null
+          } else {
+            if (typeof value !== 'string' || value.trim() === '') {
+              throw new ApiError(422, 'owner 必须是非空字符串或 null')
+            }
+            const owner = value.trim()
+            if (owner.length > CONTROL_OVERLAY_MAX_STRING) {
+              throw new ApiError(422, `owner 超过 ${CONTROL_OVERLAY_MAX_STRING} 字符上限`)
+            }
+            if (isGlobalControlValue(owner)) throw new ApiError(422, 'owner 不可为通配/全局占位')
+            normalized.owner = owner
+          }
+        } else if (key === 'approvalOwnerOnly') {
+          if (value !== null && typeof value !== 'boolean') {
+            throw new ApiError(422, 'approvalOwnerOnly 必须是布尔值或 null')
+          }
+          normalized.approvalOwnerOnly = value === null ? null : value
+        } else if (key === 'approvalMembers') {
+          if (value === null) {
+            normalized.approvalMembers = null
+          } else {
+            if (!Array.isArray(value)) throw new ApiError(422, 'approvalMembers 必须是数组或 null')
+            if (value.length > CONTROL_OVERLAY_MAX_MEMBERS) {
+              throw new ApiError(422, `approvalMembers 超过 ${CONTROL_OVERLAY_MAX_MEMBERS} 项上限`)
+            }
+            const members = []
+            for (const entry of value) {
+              const obj = plainObjectOf(entry)
+              if (obj === null) {
+                throw new ApiError(422, 'approvalMembers 每项必须是对象 { channel, accountId, userId }')
+              }
+              for (const k of Object.keys(obj)) {
+                if (k !== 'channel' && k !== 'accountId' && k !== 'userId') {
+                  throw new ApiError(422, `approvalMembers 每项只允许 channel/accountId/userId，收到 "${k}"`)
+                }
+              }
+              const triple = {}
+              for (const k of ['channel', 'accountId', 'userId']) {
+                const v = typeof obj[k] === 'string' ? obj[k].trim() : ''
+                if (v === '') throw new ApiError(422, `approvalMembers 每项的 "${k}" 必须是非空字符串`)
+                if (v.length > CONTROL_OVERLAY_MAX_STRING) {
+                  throw new ApiError(422, `approvalMembers 每项 "${k}" 超过 ${CONTROL_OVERLAY_MAX_STRING} 字符上限`)
+                }
+                if (isGlobalControlValue(v)) {
+                  throw new ApiError(422, `approvalMembers 每项 "${k}" 不可为通配/全局占位`)
+                }
+                triple[k] = v
+              }
+              members.push(triple)
+            }
+            normalized.approvalMembers = members
+          }
+        } else if (DANGEROUS_KEYS.has(key)) {
+          throw new ApiError(422, `保留键 "${key}" 不可写入（${[...DANGEROUS_KEYS].join('/')}）`)
+        } else if (SOURCE_FIELDS.includes(key)) {
+          throw new ApiError(422, `"${key}" 是会话来源字段，不可经管理台设置——授权来源只能来自会话真实来源（fail-closed）`)
+        } else {
+          throw new ApiError(422, `未知字段 "${key}"（可用：${OVERLAY_FIELDS.join('/')}）`)
+        }
+      }
+      if (Object.keys(normalized).length === 0) {
+        throw new ApiError(422, '至少提供 mode/owner/approvalOwnerOnly/approvalMembers 之一')
+      }
+
+      // 从未建档判定：store 无记录且 registry 无记录（同 patchSession 口径）
+      const stored = plainObjectOf(readTable(KEY_SESSIONS)[id])
+      if (stored === null && registrySessionOf(id) === undefined) {
+        throw new ApiError(404, `会话 "${id}" 不存在`)
+      }
+
+      if (!callSetter(router?.setSessionControl, id, normalized)) {
+        throw new ApiError(500, '会话控制覆盖写入存储失败')
+      }
+      auditGuard('setSessionControl', { id, diff: controlSummary(normalized) })
+      const control = plainObjectOf(plainObjectOf(readTable(KEY_SESSIONS)[id])?.control)
+      return { id, control: controlSummary(control) }
     },
 
     /**
@@ -667,8 +952,9 @@ export function createAdminApi(options = {}) {
      * 声明表、手写渠道读 FIELD_HINTS、入站通道读 INBOUND_FIELDS）——空 config 的通道
      * 也能渲染表单从零新建（§9-2「UI 建通道凭证」零 YAML）。
      * @returns {Array<{ type: string, direction: 'outbound'|'inbound', configured: boolean,
-     *   enabled: boolean, editable: boolean, config: object, fields: object }>}
-     *   行集合与 overview().channels 同构同序，多 config/fields/editable 字段。
+     *   enabled: boolean, editable: boolean, restartRequired: boolean, config: object, fields: object }>}
+     *   行集合与 overview().channels 同构同序，多 config/fields/editable/restartRequired 字段
+     *   （restartRequired：描述本接口 legacy 写入域的重启语义；Native 不消费此字段）。
      */
     getChannels() {
       const yamlTable = yamlOutboundOf()
@@ -676,20 +962,32 @@ export function createAdminApi(options = {}) {
         if (row.direction === 'inbound') {
           return {
             ...row,
-            config: maskSecrets(plainObjectOf(safeGet(`${row.type}:account`)) ?? {}),
+            config: maskSecrets(plainObjectOf(safeGet(`${row.type}:account`)) ?? {}, plainFieldsOf(row.type)),
             fields: { ...(INBOUND_FIELDS[row.type] ?? {}) },
           }
         }
+        // 零配置首访：出站行读取优先级 = admin:channel:<type>:outbound → 非双域 <type>:account → YAML
         const yamlConfig = plainObjectOf(yamlTable[row.type]) ?? {}
-        const account = DUAL_INBOUND_DOMAIN.has(row.type)
-          ? {}
-          : plainObjectOf(safeGet(`${row.type}:account`)) ?? {}
-        return {
+        const merged = outboundConfig !== null
+          ? serviceRawOf(row.type)
+          : (() => {
+              const adminOutbound = plainObjectOf(safeGet(`channel:${row.type}:outbound`)) ?? plainObjectOf(safeGet(`admin:channel:${row.type}:outbound`))
+              const account = DUAL_INBOUND_DOMAIN.has(row.type)
+                ? {}
+                : plainObjectOf(safeGet(`${row.type}:account`)) ?? {}
+              return adminOutbound !== null ? { ...yamlConfig, ...adminOutbound } : { ...yamlConfig, ...account }
+            })()
+        const rowOut = {
           ...row,
-          // store 字段覆盖同名 YAML 字段（字段级浅合并；数组值整体替换，如 uids）
-          config: maskSecrets({ ...yamlConfig, ...account }),
+          // store 字段覆盖同名 YAML 字段（字段级浅合并；数组值整体替换，如 uids）；
+          // plain 声明字段（wps-bot msgtype）明文回显，其余字符串照常脱敏
+          config: maskSecrets(merged, plainFieldsOf(row.type)),
           fields: channelFieldsOf(row.type),
         }
+        // spec 声明 docUrl 的渠道附官方文档跳转（wps-bot 接入指南），未声明省略该键
+        const docUrl = channelDocUrlOf(row.type)
+        if (docUrl !== undefined) rowOut.docUrl = docUrl
+        return rowOut
       })
     },
 
@@ -705,7 +1003,8 @@ export function createAdminApi(options = {}) {
      * 数组/原始值对象（webhook.headers、wxpusher.uids 等真实形态）。
      * @param {string} type - 通道类型，必须 ∈ CHANNEL_TYPES ∪ INBOUND_CHANNELS。
      * @param {object} config - 非空普通对象，键必须在该通道字段白名单内。
-     * @returns {{ type: string, saved: boolean }} saved=false = 存储不可用/写入失败降级（不抛）。
+     * @returns {{ type: string, saved: boolean, restartRequired: boolean }} saved=false = 存储
+     *   不可用/写入失败降级（不抛）；restartRequired 仍只描述本接口 legacy 写入域。
      * @throws {ApiError} 422 type 非法、config 非非空普通对象、含 webhook/未知/保留键、
      *   或字段数/值形态超限。
      */
@@ -720,6 +1019,7 @@ export function createAdminApi(options = {}) {
         throw new ApiError(422, `${type} 的 <type>:account 键域归入站机器人凭证（appId/appKey），写入 webhook 会抹掉扫码凭证；${type} 出站 webhook 请走 YAML bootstrap（cordis.patch.yml channels）`)
       }
       const allowed = channelKeyWhitelist(type)
+      const fields = channelFieldsOf(type)
       if (allowed.size === 0) {
         throw new ApiError(422, `${type} 凭证由扫码登录自动写入，不支持手工配置（可用 scripts/channel-login.mjs）`)
       }
@@ -739,13 +1039,20 @@ export function createAdminApi(options = {}) {
       try {
         if (typeof store?.set !== 'function') throw new Error('store 不可用')
         const existing = plainObjectOf(safeGet(`${type}:account`)) ?? {}
-        store.set(`${type}:account`, deepCopyPlain({ ...existing, ...config }))
+        if (setDurable(store, `${type}:account`, deepCopyPlain({ ...existing, ...config })) !== true) {
+          throw new Error('store 写入未落盘')
+        }
       } catch (error) {
         warn(`通道凭证写入失败: ${errorMessage(error)}`)
         return { type, saved: false }
       }
-      appendAudit('putChannel', { type }) // 审计只记通道名，绝不落凭证内容
-      return { type, saved: true }
+      auditGuard('putChannel', { type }) // 审计只记通道名，绝不落凭证内容
+      // v0.12.1（P1-05）：该字段继续描述 Admin legacy 写入域，不能代表 Native canonical
+      // 出站域的 applyMode。Native 口径由 src/control-surface/apply-mode.mjs 提供。
+      // v0.13（C11.5 / R6）：本接口只写 `<type>:account` 且在下次启动才并入运行时
+      // （内联注释 §putChannel 装配说明），双域通道写的是入站机器人凭证——两条路径都
+      // 必须重启才建立/替换 transport，故恒为 true；不得再用 false 谎称已生效。
+      return { type, saved: true, restartRequired: true }
     },
 
     /**
@@ -785,7 +1092,7 @@ export function createAdminApi(options = {}) {
       }
       const result = await handler()
       if (plainObjectOf(result) !== null && result.saved === true) {
-        appendAudit('scanChannel', { channel }) // 只记通道名，绝不落凭证内容
+        auditGuard('scanChannel', { channel }) // 只记通道名，绝不落凭证内容
       }
       return result
     },
@@ -802,8 +1109,9 @@ export function createAdminApi(options = {}) {
         try { return fn() } catch (error) { warn(`成员数据读取失败: ${errorMessage(error)}`); return fallback }
       }
       const members = identity === null ? [] : readSafe(() => identity.list().map((record) => ({
-        key: `${record.channel}:${record.userId}`,
+        key: memberKeyOf(record),
         channel: record.channel,
+        ...(record.accountId !== undefined ? { accountId: record.accountId } : {}),
         userId: record.userId,
         label: record.label,
         role: record.role,
@@ -812,8 +1120,9 @@ export function createAdminApi(options = {}) {
         lastSeenAt: record.lastSeenAt,
       })), [])
       const pending = identity === null ? [] : readSafe(() => identity.listPending().map((entry) => ({
-        key: `${entry.channel}:${entry.userId}`,
+        key: memberKeyOf(entry),
         channel: entry.channel,
+        ...(entry.accountId !== undefined ? { accountId: entry.accountId } : {}),
         userId: entry.userId,
         origin: entry.origin,
         at: entry.at,
@@ -853,7 +1162,7 @@ export function createAdminApi(options = {}) {
         }
       }
       if (Object.keys(normalized).length === 0) throw new ApiError(422, '至少提供 label 或 role 之一')
-      const current = identity.list(parsed.channel).find((record) => record.userId === parsed.userId)
+      const current = resolveMemberRecord(identity, parsed)
       if (current === undefined) throw new ApiError(404, `成员不存在：${parsed.raw}`)
       if (normalized.role === 'member' && current.role === 'owner') {
         let owners = 0
@@ -862,9 +1171,9 @@ export function createAdminApi(options = {}) {
           throw new ApiError(422, '末位 owner 不可降级（否则实例将无人可管理）；请先在成员页提升另一位 owner')
         }
       }
-      const result = identity.updateBinding(parsed.channel, parsed.userId, normalized)
+      const result = identity.updateBinding(current.channel, current.userId, normalized, current.accountId)
       if (result.ok !== true) throw new ApiError(404, `成员不存在：${parsed.raw}`)
-      appendAudit('putMember', { key: parsed.raw, diff: normalized })
+      auditGuard('putMember', { key: parsed.raw, diff: normalized })
       return { key: parsed.raw, saved: true, record: result.record }
     },
 
@@ -879,7 +1188,7 @@ export function createAdminApi(options = {}) {
       }
       const parsed = parseMemberKey(key)
       if (parsed === null) throw new ApiError(422, MEMBER_KEY_HINT)
-      const current = identity.list(parsed.channel).find((record) => record.userId === parsed.userId)
+      const current = resolveMemberRecord(identity, parsed)
       if (current === undefined) throw new ApiError(404, `成员不存在：${parsed.raw}`)
       if (current.role === 'owner') {
         let owners = 0
@@ -888,9 +1197,9 @@ export function createAdminApi(options = {}) {
           throw new ApiError(422, '末位 owner 不可删除（否则实例将无人可管理）；请先转移角色或添加成员')
         }
       }
-      const result = identity.removeBinding(parsed.channel, parsed.userId)
+      const result = identity.removeBinding(current.channel, current.userId, current.accountId)
       if (result.ok !== true) throw new ApiError(404, `成员不存在：${parsed.raw}`)
-      appendAudit('deleteMember', { key: parsed.raw, role: current.role })
+      auditGuard('deleteMember', { key: parsed.raw, role: current.role })
       return { key: parsed.raw, deleted: true }
     },
 
@@ -905,12 +1214,13 @@ export function createAdminApi(options = {}) {
       }
       const parsed = parseMemberKey(key)
       if (parsed === null) throw new ApiError(422, MEMBER_KEY_HINT)
-      const result = identity.confirmPending(parsed.channel, parsed.userId)
+      const pending = resolveMemberRecord(identity, parsed, true)
+      const result = identity.confirmPending(pending?.channel ?? parsed.channel, pending?.userId ?? parsed.userId, pending?.accountId ?? parsed.accountId)
       if (result.ok !== true) {
         if (result.reason === 'already-bound') throw new ApiError(409, `该身份已是成员：${parsed.raw}`)
         throw new ApiError(404, `待确认绑定不存在：${parsed.raw}`)
       }
-      appendAudit('confirmPending', { key: parsed.raw })
+      auditGuard('confirmPending', { key: parsed.raw })
       return { key: parsed.raw, confirmed: true, record: result.record }
     },
 
@@ -925,9 +1235,10 @@ export function createAdminApi(options = {}) {
       }
       const parsed = parseMemberKey(key)
       if (parsed === null) throw new ApiError(422, MEMBER_KEY_HINT)
-      const result = identity.dismissPending(parsed.channel, parsed.userId)
+      const pending = resolveMemberRecord(identity, parsed, true)
+      const result = identity.dismissPending(pending?.channel ?? parsed.channel, pending?.userId ?? parsed.userId, pending?.accountId ?? parsed.accountId)
       if (result.ok !== true) throw new ApiError(404, `待确认绑定不存在：${parsed.raw}`)
-      appendAudit('dismissPending', { key: parsed.raw })
+      auditGuard('dismissPending', { key: parsed.raw })
       return { key: parsed.raw, dismissed: true }
     },
 
@@ -1004,6 +1315,275 @@ export function createAdminApi(options = {}) {
      */
     appendAudit(action, detail) {
       appendAudit(String(action ?? 'unknown'), detail)
+    },
+
+    // ---------- 路线图阶段 2A：远程提问管理台裁决（2026-08-26）----------
+    /**
+     * 读「当前待处理远程问题」脱敏快照（只读，query 永不抛、按空表降级）。
+     * 单条仅含 { ref, question, options, multiSelect, status, agent(掩码), source(掩码),
+     * createdAt, expiresAt }——绝无 token / 凭证 / 完整聊天或 agent 标识 / 作答隐私；
+     * 查询本身是安全的，故不要求 owner 证明；结算（settleQuestion）才需 owner/admin 证明。
+     * @returns {Array<object>}
+     */
+    getPendingQuestions() {
+      if (questions === null || typeof questions.adminPending !== 'function') return []
+      try { return questions.adminPending() } catch { return [] }
+    },
+
+    /**
+     * 管理台提交远程提问裁决（choose/reject，2026-08-26）。只对当前待决问题生效，且
+     * 结算一律经 Control Core 唯一裁决（授权/首达采纳/单次结算全在桥 + 控制核心内承接），
+     * 本层只做参数校验 + owner/admin 本地证明 + 委托 + 审计 + 安全错误映射，绝不复制
+     * ledger 结算或直写状态。
+     * owner/admin 本地证明：需 identity 已装配且至少一个 owner 绑定（否则无法证明操作者是
+     * 授权管理员 → fail-closed 501/403）；任何内部异常不产生任何变更。
+     * @throws {ApiError} 422 参数非法；404 未知问题/无目标；410 过期；403 未授权/无 owner；
+     *   409 重复提交或手机先答（already-handled）；501 能力缺失/未接线
+     * @returns {{ ref: string, action: string, settled: boolean, alreadyHandled: boolean, message: string, optionLabels: string[] }}
+     */
+    settleQuestion(body = {}) {
+      const ref = String(body?.ref ?? '').trim()
+      const action = String(body?.action ?? '').trim().toLowerCase()
+      if (ref === '' || (action !== 'choose' && action !== 'reject')) {
+        throw new ApiError(422, '必须提供 ref 与 action（choose|reject）')
+      }
+      // owner/admin 本地证明：无身份层 / 无任何 owner → 无法证明操作者是授权管理员 → fail-closed
+      if (identity === null || typeof identity?.ownerCount !== 'function') {
+        throw new ApiError(501, '身份层未装配，无法证明管理员操作者身份')
+      }
+      let ownerCount = 0
+      try { ownerCount = identity.ownerCount() } catch { ownerCount = 0 }
+      if (ownerCount < 1) throw new ApiError(403, '当前没有已绑定 owner，无法证明本地管理员身份')
+      if (questions === null || typeof questions?.adminSettle !== 'function') {
+        throw new ApiError(501, '问题桥未装配，无法结算远程提问')
+      }
+      if (control === null || typeof control?.handle !== 'function') {
+        throw new ApiError(501, 'Control Core 未接线，结算入口不可用（fail-closed）')
+      }
+      let result
+      try {
+        result = questions.adminSettle({
+          ref,
+          action,
+          options: Array.isArray(body?.options) ? body.options : [],
+        })
+      } catch {
+        throw new ApiError(500, '结算时发生内部错误，未执行任何变更')
+      }
+      if (result === null || typeof result !== 'object') {
+        throw new ApiError(409, '结算未生效（内部状态不可解释）')
+      }
+      const auditDetail = { ref, action, handled: result.handled === true }
+      // G-05（2026-08-28）：审计是可观测性副作用——裁决已在 Control Core 内生效，磁盘满/
+      // 权限异常不得把成功裁决翻成 500（前端会引导重试，重试命中 already-handled 再报错，
+      // 内外状态认知分叉）。auditGuard 独立兜底：审计写失败只 warn（stderr + host logger），
+      // 继续按已生效结果返回；代价是该次审计行缺失，降级必须在日志里可见。
+      auditGuard('settleQuestion',
+        result.ok === true
+          ? { ...auditDetail, settled: true }
+          : { ...auditDetail, settled: false, reason: String(result.reason ?? 'unknown') })
+      // 安全错误映射（桥内已 fail-closed；本层只挑状态码，不让 token/完整标识符进响应）
+      if (result.ok === true) {
+        return { ref, action, settled: true, alreadyHandled: false, message: String(result.message ?? '已裁决'), optionLabels: result.optionLabels ?? [] }
+      }
+      if (result.handled === true) throw new ApiError(409, String(result.message ?? '该问题已被裁决（首达采纳），本次未生效'))
+      if (result.reason === 'expired') throw new ApiError(410, String(result.message ?? '该问题已过期'))
+      if (result.reason === 'unknown_question') throw new ApiError(404, String(result.message ?? '未找到该待决问题'))
+      if (result.reason === 'no_target') throw new ApiError(404, String(result.message ?? '该问题没有可用的来源目标'))
+      if (result.reason === 'invalid_action' || result.reason === 'invalid_option') throw new ApiError(422, String(result.message ?? '非法选项/动作'))
+      if (result.reason === 'unauthorized') throw new ApiError(403, String(result.message ?? '无权限结算该问题'))
+      if (result.reason === 'not_available') throw new ApiError(501, String(result.message ?? '结算当前不可用'))
+      // 兜底：任何未枚举失败都按未生效处理（fail-closed，绝不假报成功）
+      throw new ApiError(409, String(result.message ?? '结算未生效（未知原因）'))
+    },
+
+    // ---------- 零配置首访：方向明确的通道 API ----------
+    // 出站与入站分离：出站写 admin:channel:<type>:outbound，入站写 <type>:account。
+    // 旧 putChannel/testChannel 语义一字不改（旧路由与旧 state 数据兼容红线）——
+    // 旧路由仍写 <type>:account、仍受双域 webhook 422 约束；新代码一律走方向路由。
+
+    /**
+     * 写出站通道配置（admin 自有键 `admin:channel:<type>:outbound`）。
+     * 字段级合并：新 config 覆盖既有同名键，其余键保留。双域通道（feishu/dingtalk）
+     * 的出站 webhook 在此写入——不再受旧 `<type>:account` 入站键域限制。
+     * @param {string} type - 出站通道类型（∈ CHANNEL_TYPES）
+     * @param {object} config - 非空普通对象
+     * @returns {{ type: string, saved: boolean, direction: 'outbound' }}
+     * @throws {ApiError} 422 校验失败；500 存储写入失败
+     */
+    putOutboundChannel(type, config) {
+      if (typeof type !== 'string' || !OUTBOUND_SET.has(type)) {
+        throw new ApiError(422, `未知出站通道类型 "${String(type)}"（可用：${CHANNEL_TYPES.join('/')}）`)
+      }
+      if (outboundConfig !== null && typeof outboundConfig?.save === 'function') {
+        try {
+          const result = outboundConfig.save(type, config)
+          auditGuard('putOutboundChannel', { type })
+          return { ...result, type, saved: result?.saved === true, direction: 'outbound' }
+        } catch (error) {
+          warn(`出站通道配置写入失败: ${errorMessage(error)}`)
+          const status = error?.code === 'bad-request' || error?.code === 'not-configured' ? 422 : 500
+          throw new ApiError(status, errorMessage(error))
+        }
+      }
+      let split
+      try {
+        split = splitSecretPatch(config)
+      } catch (error) {
+        throw new ApiError(422, error.message)
+      }
+      const patch = split.patch
+      const clear = new Set(split.clear)
+      if (patch === null || (Object.keys(patch).length === 0 && clear.size === 0)) {
+        throw new ApiError(422, 'config 必须是非空对象')
+      }
+      const allowed = channelKeyWhitelist(type)
+      if (allowed.size === 0) {
+        throw new ApiError(422, `${type} 暂不支持手工配置`)
+      }
+      if (Object.keys(patch).length + clear.size > MAX_CHANNEL_KEYS) {
+        throw new ApiError(422, `字段数超过上限（最多 ${MAX_CHANNEL_KEYS} 个）`)
+      }
+      for (const key of clear) {
+        if (DANGEROUS_KEYS.has(key) || !allowed.has(key)) {
+          throw new ApiError(422, `未知字段 "${key}"（${type} 可用字段：${[...allowed].join('/')}）`)
+        }
+        if (isPublicExposure(fields[key])) {
+          throw new ApiError(422, `公共字段 "${key}" 不支持清除`)
+        }
+      }
+      for (const [key, value] of Object.entries(patch)) {
+        if (DANGEROUS_KEYS.has(key)) {
+          throw new ApiError(422, `保留键 "${key}" 不可写入`)
+        }
+        if (!allowed.has(key)) {
+          throw new ApiError(422, `未知字段 "${key}"（${type} 可用字段：${[...allowed].join('/')}）`)
+        }
+        if (value === null) {
+          if (isPublicExposure(fields[key])) {
+            throw new ApiError(422, `公共字段 "${key}" 不支持清除`)
+          }
+          clear.add(key)
+          delete patch[key]
+          continue
+        }
+        const bad = describeBadChannelValue(key, value)
+        if (bad !== null) throw new ApiError(422, bad)
+      }
+      try {
+        if (typeof store?.set !== 'function') throw new Error('store 不可用')
+        const existing = plainObjectOf(safeGet(`admin:channel:${type}:outbound`)) ?? {}
+        const next = { ...existing, ...patch }
+        for (const key of clear) delete next[key]
+        if (setDurable(store, `admin:channel:${type}:outbound`, deepCopyPlain(next)) !== true) {
+          throw new Error('store 写入未落盘')
+        }
+      } catch (error) {
+        warn(`出站通道配置写入失败: ${errorMessage(error)}`)
+        return { type, saved: false, direction: 'outbound' }
+      }
+      auditGuard('putOutboundChannel', { type })
+      return { type, saved: true, direction: 'outbound' }
+    },
+
+    /**
+     * 删除出站通道配置（移除 `admin:channel:<type>:outbound` 键）。
+     * @param {string} type - 出站通道类型
+     * @returns {{ type: string, deleted: boolean, direction: 'outbound' }}
+     * @throws {ApiError} 422 类型非法；404 配置不存在；500 存储写入失败
+     */
+    deleteOutboundChannel(type, options = {}) {
+      if (typeof type !== 'string' || !OUTBOUND_SET.has(type)) {
+        throw new ApiError(422, `未知出站通道类型 "${String(type)}"`)
+      }
+      if (outboundConfig !== null && typeof outboundConfig?.remove === 'function') {
+        try {
+          const result = outboundConfig.remove(type, options)
+          auditGuard('deleteOutboundChannel', { type, mode: options?.mode ?? 'fallback' })
+          return { ...result, type, deleted: result?.deleted === true, direction: 'outbound' }
+        } catch (error) {
+          warn(`出站通道配置删除失败: ${errorMessage(error)}`)
+          const status = error?.code === 'not-found' ? 404 : error?.code === 'bad-request' ? 422 : 500
+          throw new ApiError(status, errorMessage(error))
+        }
+      }
+      const key = `admin:channel:${type}:outbound`
+      const existing = plainObjectOf(safeGet(key))
+      if (existing === null) {
+        throw new ApiError(404, `出站配置不存在：${type}`)
+      }
+      try {
+        if (deleteDurable(store, key).durable !== true) throw new Error('store 删除未落盘')
+      } catch (error) {
+        warn(`出站通道配置删除失败: ${errorMessage(error)}`)
+        throw new ApiError(500, '出站配置删除失败')
+      }
+      auditGuard('deleteOutboundChannel', { type })
+      return { type, deleted: true, direction: 'outbound' }
+    },
+
+    /**
+     * 即时测试出站通道（读取最新 YAML+state 合并配置，无需重启）。
+     * @param {string} type - 出站通道类型
+     * @returns {Promise<object>} runChannelTest 结果原样透传
+     * @throws {ApiError} 501 渠道未配置或 channelTest 未注入
+     */
+    async testOutboundChannel(type) {
+      if (typeof channelTest !== 'function') {
+        throw new ApiError(501, '连通性测试不可用（未装配 channelTest）')
+      }
+      if (typeof type !== 'string' || !OUTBOUND_SET.has(type)) {
+        throw new ApiError(501, `未知出站通道类型 "${String(type)}"`)
+      }
+      if (outboundConfig !== null && typeof outboundConfig?.raw === 'function') {
+        const raw = serviceRawOf(type)
+        if (Object.keys(raw).length === 0) throw new ApiError(501, `渠道 "${type}" 未配置，无法测试`)
+        return await channelTest(type, raw)
+      }
+      // 读取最新合并配置（当前 YAML 原始行 ⊕ 当前 admin:channel:<type>:outbound）——
+      // raw 行剔除 type/enabled 元键，runChannelTest 内部自行 resolveEnvRefs + adapter.resolve。
+      const rawTable = yamlRawOf()
+      const adminOutbound = plainObjectOf(safeGet(`channel:${type}:outbound`)) ?? plainObjectOf(safeGet(`admin:channel:${type}:outbound`))
+      const rawRow = plainObjectOf(rawTable[type]) ?? {}
+      const { type: _dropType, enabled: _dropEnabled, ...yamlRaw } = rawRow
+      const merged = adminOutbound !== null ? { ...yamlRaw, ...adminOutbound } : yamlRaw
+      if (Object.keys(merged).length === 0) {
+        throw new ApiError(501, `渠道 "${type}" 未配置，无法测试`)
+      }
+      return await channelTest(type, merged)
+    },
+
+    /**
+     * 写入站通道配置（`<type>:account`，与扫码落盘同域）。
+     * @param {string} type - 入站通道类型（∈ INBOUND_CHANNELS）
+     * @param {object} config - 非空普通对象
+     * @returns {{ type: string, saved: boolean, direction: 'inbound' }}
+     * @throws {ApiError} 422 校验失败；500 存储写入失败
+     */
+    putInboundChannel(type, config) {
+      try {
+        return inboundPort.put(type, config)
+      } catch (error) {
+        const status = Number(error?.status) || 500
+        if (status >= 500) warn(`入站通道配置写入失败: ${errorMessage(error)}`)
+        throw new ApiError(status, errorMessage(error))
+      }
+    },
+
+    /**
+     * 删除入站通道配置（移除 `<type>:account` 键）。
+     * @param {string} type - 入站通道类型
+     * @returns {{ type: string, deleted: boolean, direction: 'inbound' }}
+     * @throws {ApiError} 422 类型非法；404 配置不存在；500 存储写入失败
+     */
+    deleteInboundChannel(type) {
+      try {
+        return inboundPort.remove(type)
+      } catch (error) {
+        const status = Number(error?.status) || 500
+        if (status >= 500) warn(`入站通道配置删除失败: ${errorMessage(error)}`)
+        throw new ApiError(status, errorMessage(error))
+      }
     },
   }
   return api

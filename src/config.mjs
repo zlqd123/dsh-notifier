@@ -6,56 +6,31 @@
 //  - 密钥字段不落日志：SECRET_FIELDS 声明每渠道的 secret 键，诊断日志只回「已配置」事实与末 4 位。
 
 import { NotifyError, ERROR_CODES } from './adapters/_shared.mjs'
-import * as telegram from './adapters/telegram.mjs'
-import * as dingtalk from './adapters/dingtalk.mjs'
-import * as feishu from './adapters/feishu.mjs'
-import * as wxpusher from './adapters/wxpusher.mjs'
-import * as pushplus from './adapters/pushplus.mjs'
-import * as serverchan from './adapters/serverchan.mjs'
-import * as bark from './adapters/bark.mjs'
-import * as webhook from './adapters/webhook.mjs'
-import * as bell from './adapters/bell.mjs'
-// 阶段 1 新增：spec 引擎吃声明表产出 adapter + token 型代码适配器。
-import { SPEC_CHANNELS } from './adapters/spec-channels.mjs'
-import { makeSpecAdapters, secretFieldsOfTable } from './adapters/_engine.mjs'
+import { isPublicExposure } from './security/exposure.mjs'
+// dsh-notifier-qq：QQ 专项裁剪版，出站只保留官方机器人渠道。
+// 其余渠道（telegram/钉钉/飞书/wxpusher/…/spec 声明表）在本副本中整体移除：
+// CHANNEL_TYPES 是管理台、控制面、路由与出站装配的唯一渠道全集来源，收缩此处即全局收缩。
 import * as qqBot from './adapters/qq-bot.mjs'
-import * as wecomApp from './adapters/wecom-app.mjs'
-import * as desktop from './adapters/desktop.mjs'
 
-const SPEC_ADAPTERS = makeSpecAdapters(SPEC_CHANNELS)
-
-/** adapter 注册表：type -> { type, resolve, send }。既有 8 个零改动；spec 渠道由引擎产出。 */
+/** adapter 注册表：type -> { type, resolve, send }。本副本仅注册 qq-bot。 */
 export const ADAPTERS = Object.freeze({
-  telegram,
-  dingtalk,
-  feishu,
-  wxpusher,
-  pushplus,
-  serverchan,
-  bark,
-  webhook,
-  bell,
-  desktop,
-  ...SPEC_ADAPTERS,
   'qq-bot': qqBot,
-  'wecom-app': wecomApp,
 })
 
 export const CHANNEL_TYPES = Object.freeze(Object.keys(ADAPTERS))
 
-/** 每渠道的 secret 键：这些字段在日志/诊断里必须脱敏。spec 渠道由声明表自动登记。 */
+/**
+ * 远程日志（Commit20 /log）hard caps：用户不可放大的**硬上限**。
+ * 敏感诊断能力（ledger 标题可能含任务上下文），故 remoteLog 配置再怎么写也只在此范围内生效。
+ */
+export const REMOTE_LOG_HARD_MAX_LINES = 200
+export const REMOTE_LOG_HARD_MAX_BYTES = 8192
+/** /log 缺省回传条数（无参时）。 */
+export const REMOTE_LOG_DEFAULT_LINES = 20
+
+/** 每渠道的 secret 键：这些字段在日志/诊断里必须脱敏。 */
 const SECRET_FIELDS = {
-  telegram: ['botToken'],
-  dingtalk: ['webhook', 'secret'],
-  feishu: ['webhook', 'secret'],
-  wxpusher: ['appToken', 'uids', 'topicIds'],
-  pushplus: ['token'],
-  serverchan: ['sct', 'sendKey', 'sctKey'],
-  bark: ['key', 'barkUrl'],
-  webhook: ['url', 'headers'],
-  ...secretFieldsOfTable(SPEC_CHANNELS),
-  'qq-bot': ['appId', 'appSecret'],
-  'wecom-app': ['corpid', 'secret'],
+  'qq-bot': ['appId', 'appSecret', 'gatewayToken'],
 }
 
 /** 取某渠道的 secret 键列表（未知渠道返回空数组）。 */
@@ -69,56 +44,15 @@ export function secretFieldsOf(type) {
  * spec 渠道不在此表——由 ADAPTERS[type].spec.fields 机器读取（单一事实源）。
  */
 const FIELD_HINTS = {
-  telegram: {
-    botToken: { required: true, secret: true, desc: 'Telegram Bot Token（@BotFather 获取）' },
-    chatId: { required: true, secret: true, desc: '接收者的 chat id（可向 @userinfobot 查询）' },
-  },
-  dingtalk: {
-    webhook: { required: true, secret: true, desc: '钉钉群自定义机器人完整地址' },
-    secret: { required: false, secret: true, desc: '加签密钥（机器人安全设置选「加签」时填）' },
-  },
-  feishu: {
-    webhook: { required: true, secret: true, desc: '飞书群自定义机器人完整地址' },
-    secret: { required: false, secret: true, desc: '加签密钥（机器人安全设置选「签名校验」时填）' },
-  },
-  wxpusher: {
-    appToken: { required: true, secret: true, desc: 'WxPusher 应用 APP_TOKEN（wxpusher.zjiecode.com）' },
-    uids: { required: false, secret: true, desc: '接收者 UID 数组，如 ["UID_xxx"]（与 topicIds 至少一项）' },
-    topicIds: { required: false, secret: false, desc: '主题 ID 数组（群发用）' },
-  },
-  pushplus: {
-    token: { required: true, secret: true, desc: 'pushplus token（www.pushplus.plus）' },
-  },
-  serverchan: {
-    sct: { required: true, secret: true, desc: 'Server酱 SENDKEY（sct.ftqq.com）' },
-  },
-  bark: {
-    key: { required: true, secret: true, desc: 'Bark 设备 key（App 内复制）' },
-    barkUrl: { required: false, secret: true, desc: '自建 Bark 服务地址（默认官方）' },
-    device: { required: false, secret: false, desc: '设备名（多设备时指定）' },
-  },
-  webhook: {
-    url: { required: true, secret: true, desc: '接收 POST JSON 的 webhook 地址' },
-    headers: { required: false, secret: true, desc: '附加请求头对象，如 {"Authorization": "..."}' },
-  },
-  bell: {
-    count: { required: false, secret: false, desc: '响铃次数 1-5（默认 1）' },
-  },
-  desktop: {
-    sound: { required: false, secret: false, desc: '提示音：auto（默认，仅紧急级）/ always / never' },
-  },
   'qq-bot': {
-    appId: { required: true, secret: true, desc: 'QQ 开放平台开发者 ID（q.qq.com → 机器人开发设置）' },
-    appSecret: { required: true, secret: true, desc: '同页面 AppSecret' },
+    gatewayUrl: { required: true, secret: false, desc: 'noti-gateway 地址（如 http://gateway.example:10086）；出站唯一投递路径' },
+    gatewayToken: { required: true, secret: true, desc: 'noti-gateway 的 auth.token（Bearer 鉴权）' },
+    gatewaySource: { required: false, secret: false, desc: '网关来源标识（默认 dsh），决定网关侧配额池归属' },
+    appId: { required: false, secret: true, desc: 'QQ 开放平台开发者 ID——仅入站网关使用，出站不再需要' },
+    appSecret: { required: false, secret: true, desc: '同页面 AppSecret——仅入站网关使用' },
     targetType: { required: false, secret: false, desc: '"user"（单聊，默认）或 "group"（群聊）' },
     userId: { required: false, secret: false, desc: '单聊目标用户 openid（targetType=user 时）' },
     groupId: { required: false, secret: false, desc: '群 open id（targetType=group 时）' },
-  },
-  'wecom-app': {
-    corpid: { required: true, secret: true, desc: '企业 ID（企业微信管理后台「我的企业」）' },
-    secret: { required: true, secret: true, desc: '应用 Secret（管理后台「应用管理」）' },
-    agentId: { required: true, secret: false, desc: '应用 AgentId（数字）' },
-    toUser: { required: false, secret: false, desc: '接收成员账号，默认 "@all"' },
   },
 }
 
@@ -134,6 +68,23 @@ export function channelFieldsOf(type) {
     : FIELD_HINTS[type]
   if (fields === null || typeof fields !== 'object') return {}
   return { ...fields }
+}
+
+/**
+ * 渠道是否声明 fixedOptions（官方固定端点，不暴露 timeoutMs/apiBase 等
+ * 引擎级调优键——管理台键白名单据此收窄）。未知渠道返回 false。
+ */
+export function channelFixedOptions(type) {
+  return ADAPTERS[type]?.spec?.fixedOptions === true
+}
+
+/**
+ * 渠道官方接入文档地址（spec 声明 docUrl 时返回，管理台卡片渲染跳转链接）。
+ * 非法/未声明返回 undefined（行内省略该键）。
+ */
+export function channelDocUrlOf(type) {
+  const url = ADAPTERS[type]?.spec?.docUrl
+  return typeof url === 'string' && url !== '' ? url : undefined
 }
 
 /**
@@ -187,16 +138,18 @@ function maskValue(value) {
 /** 把某渠道配置脱敏成可安全打印的摘要（只回「是否配置」+ 末 4 位）。 */
 export function maskChannelConfig(type, cfg) {
   const secrets = new Set(secretFieldsOf(type))
+  const fields = channelFieldsOf(type)
   const masked = {}
   for (const [key, value] of Object.entries(cfg ?? {})) {
-    masked[key] = secrets.has(key) ? maskValue(value) : value
+    const knownPublic = Object.prototype.hasOwnProperty.call(fields, key) && isPublicExposure(fields[key])
+    masked[key] = !knownPublic || secrets.has(key) ? maskValue(value) : value
   }
   return masked
 }
 
 /**
  * 解析并归一化 channels[] 配置。
- * 返回 { enabled, debounceMs, summaryMaxChars, titlePrefix, channels }：
+ * 返回 { enabled, debounceMs, summaryMaxChars, titlePrefix, lang, channels }：
  *   channels = [{ type, config }] 已 resolve 的可发送渠道；
  *   skipped   = [{ type, reason }] 未配置/禁用/未知类型的渠道（调用方负责 warn）。
  * 绝不 throw：任何单渠道问题都只是跳过，不弄崩启动。
@@ -204,13 +157,23 @@ export function maskChannelConfig(type, cfg) {
 export function resolveConfig(config = {}) {
   const raw = config ?? {}
   const enabled = raw.enabled !== false
+  // 尾沿防抖窗口：task 完成通知的「等待感」全部来自这里——窗口内最后一条事件到点才推送。
+  // 10s 的旧默认让每次任务完成都必然多等最多 10 秒，属于设计期取值而非需求。
+  // 默认降到 1500ms：仍能合并「start→end 快速连发 / 连续多 turn」的重复通知，
+  // 但用户几乎感知不到延迟。需要更强合并的用户可显式把 debounceMs 调大。
   const debounceMs = typeof raw.debounceMs === 'number' && Number.isFinite(raw.debounceMs)
     ? Math.max(0, Math.trunc(raw.debounceMs))
-    : 10000
+    : 1500
   const summaryMaxChars = typeof raw.summaryMaxChars === 'number' && Number.isFinite(raw.summaryMaxChars)
     ? Math.max(0, Math.trunc(raw.summaryMaxChars))
     : 500
   const titlePrefix = typeof raw.titlePrefix === 'string' ? raw.titlePrefix.trim() : ''
+  // S-05（CWE-200）出站脱敏档位：minimal（默认）= 摘录 80 字符 + 密钥形态打码；
+  // extended = 维持原文（用户显式选择向第三方 IM 外发完整片段，README 已声明数据流向）。
+  // 非法值一律回落 minimal：安全配置的非法值不配得到宽松解释。
+  const redaction = raw.redaction === 'extended' ? 'extended' : 'minimal'
+  // 自动推送文案语言：'zh'（默认）| 'en'。未知值回落 zh，归一化与 redaction 同法。
+  const lang = raw.lang === 'en' ? 'en' : 'zh'
 
   // 事件粒度开关（阶段 2 规则引擎）：默认全开。turnEnd 支持两种写法：
   //   turnEnd: false                     → 整类关闭
@@ -266,17 +229,37 @@ export function resolveConfig(config = {}) {
   // v0.8 远程提问（ask_user 工具）：默认启用；超时默认 5 分钟（30s-30min 钳制在
   // questions/router 的 validateAskArgs），限流默认 6 次/分钟（提问比通知更稀缺）。
   const rawQuestions = (raw.questions !== null && typeof raw.questions === 'object') ? raw.questions : {}
+  // v0.10 Web-first 远程升级（任务书 3.3/8）：Stage 0（pending，Web 立即可见）→ Stage 1
+  // 推主绑定 IM 的延迟默认 20s；Stage 2 备用目标提醒默认 60s（从 t=0）。显式 0 关闭 Web-first
+  // （立即推送）。remoteEnabled=false 只保留 Web 可见、永不推 IM（关闭远程推送不破坏原生 Web 提问）。
+  const questionsWebFirstRaw = Number(rawQuestions.webFirstMs)
+  const questionsReminderRaw = Number(rawQuestions.reminderMs)
   const questions = {
     enabled: rawQuestions.enabled !== false,
-    // 双端并行（2026-08-24）：工具执行即同时弹桌面 Web 弹窗 + 推远端卡片，先答先算，
-    // 与审批 parallel 同构。缺省开启；parallel:false 回落单端瀑布（旧行为）。
-    parallel: rawQuestions.parallel !== false,
     timeoutMs: typeof rawQuestions.timeoutMs === 'number' && Number.isFinite(rawQuestions.timeoutMs) && rawQuestions.timeoutMs > 0
       ? Math.trunc(rawQuestions.timeoutMs)
       : 300_000,
     rateLimitPerMinute: typeof rawQuestions.rateLimitPerMinute === 'number' && Number.isFinite(rawQuestions.rateLimitPerMinute)
       ? Math.max(0, Math.trunc(rawQuestions.rateLimitPerMinute))
       : 6,
+    webFirstMs: Number.isFinite(questionsWebFirstRaw) ? Math.max(0, Math.trunc(questionsWebFirstRaw)) : 20_000,
+    reminderMs: Number.isFinite(questionsReminderRaw) ? Math.max(0, Math.trunc(questionsReminderRaw)) : 60_000,
+    remoteEnabled: rawQuestions.remoteEnabled !== false,
+  }
+
+  // 远程日志（Commit20 /log）：敏感诊断能力，**默认关**（enabled 仅显式 true 才开）。
+  // maxLines/maxBytes 一律 clamp 到 hard caps（§11.5：用户不能放大），非有限数字回落上限：
+  // 安全配置的非法值不配得到宽松解释（与 graceSeconds 同法，只认真正的 number）。
+  // owner-only 与脱敏在 conversation 层执行。
+  const rawRemoteLog = (raw.remoteLog !== null && typeof raw.remoteLog === 'object' && !Array.isArray(raw.remoteLog)) ? raw.remoteLog : {}
+  const remoteLog = {
+    enabled: rawRemoteLog.enabled === true,
+    maxLines: typeof rawRemoteLog.maxLines === 'number' && Number.isFinite(rawRemoteLog.maxLines)
+      ? Math.min(REMOTE_LOG_HARD_MAX_LINES, Math.max(1, Math.trunc(rawRemoteLog.maxLines)))
+      : REMOTE_LOG_HARD_MAX_LINES,
+    maxBytes: typeof rawRemoteLog.maxBytes === 'number' && Number.isFinite(rawRemoteLog.maxBytes)
+      ? Math.min(REMOTE_LOG_HARD_MAX_BYTES, Math.max(256, Math.trunc(rawRemoteLog.maxBytes)))
+      : REMOTE_LOG_HARD_MAX_BYTES,
   }
 
   // 空闲宽限窗（阶段 2 规则引擎）：turn 结束后等 N 秒，期间用户在页面/终端输入即取消打扰。
@@ -346,15 +329,31 @@ export function resolveConfig(config = {}) {
     limitPerMinutePerSource: Number.isFinite(publicLimit) && publicLimit >= 0 ? Math.trunc(publicLimit) : 10,
     emit: rawPublic.emit !== false,
   }
-
+  // Optional facade-instance budgets.  Omit absent keys to preserve the
+  // historical resolved shape; createPublicFacade supplies finite defaults.
+  for (const [key, fallback] of [
+    ['maxCalls', 10_000],
+    ['maxBytes', 10 * 1024 * 1024],
+    ['maxConcurrent', 16],
+    ['maxQueue', 64],
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(rawPublic, key)) continue
+    const value = Number(rawPublic[key])
+    publicBlock[key] = Number.isFinite(value) && value >= 0
+      ? Math.trunc(value)
+      : fallback
+  }
   return {
     enabled,
     debounceMs,
     summaryMaxChars,
     titlePrefix,
+    redaction,
+    lang,
     events,
     toolRateLimitPerMinute,
     questions,
+    remoteLog,
     graceSeconds,
     routing: (raw.routing !== null && typeof raw.routing === 'object') ? raw.routing : {},
     // v0.6.1：inbound 块对齐 channels 的 ${ENV:NAME} 密钥引用语义（真机事故 §7：

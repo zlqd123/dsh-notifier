@@ -1,218 +1,233 @@
-# dsh-notifier
+# dsh-notifier-gate
 
-> **Your agent, in your pocket.** — 通知、审批、遥控，全在你的手机里。
+DSH 的 QQ 官方机器人通知插件，是 [`dsh-notifier`](https://github.com/THEWOLFWALKER/dsh-notifier) 的 **QQ 专项裁剪版**。
 
-**English** · [**简体中文**](README.zh-CN.md)
+只做两件事，把这两件事做实：
 
-![DSH](https://img.shields.io/badge/DSH-DeepSeek%20Harness-1F6FEB?style=flat-square)
-![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933?style=flat-square&logo=node.js&logoColor=white)
-![JavaScript](https://img.shields.io/badge/JavaScript-ESM-F7DF1E?style=flat-square&logo=javascript&logoColor=black)
-![Cordis](https://img.shields.io/badge/Cordis-plugin-FF6B6B?style=flat-square)
-![Zero deps](https://img.shields.io/badge/zero%20deps-000000?style=flat-square)
-![Bilingual](https://img.shields.io/badge/bilingual-EN%2F%E7%AE%80%E4%BD%93-00A98F?style=flat-square)
-![Channels](https://img.shields.io/badge/channels-27-00B4D8?style=flat-square)
+1. **出站**：把「任务完成 / 需要批准 / 远程提问」等事件推到你的 QQ（官方机器人 v2 接口，单聊或群）。
+2. **入站**：用同一个机器人账号开 WebSocket 网关，接收你的回复（编号裁决、`/pair` 配对、会话路由）。
 
-![npm version](https://img.shields.io/npm/v/dsh-notifier?style=flat-square&logo=npm&logoColor=white)
-![tests](https://img.shields.io/badge/tests-846-brightgreen?style=flat-square)
-![license](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
-![awesome-dsh-plugin](https://img.shields.io/badge/awesome--dsh--plugin-listed-00B4D8?style=flat-square)
-![omdsh workshop](https://img.shields.io/badge/omdsh-workshop-7C3AED?style=flat-square)
+其余 27 个渠道（Telegram / 钉钉 / 飞书 / WxPusher / PushPlus / Server酱 / Bark / Webhook / 企微应用 …）在本副本中全部移除。
 
-![never miss](https://img.shields.io/badge/never%20miss-a%20turn-00BFFF?style=flat-square)
-![silence](https://img.shields.io/badge/silence%20never-approves-9C27B0?style=flat-square)
-![push](https://img.shields.io/badge/push%20it-real%20good-FF4081?style=flat-square)
+---
 
-Unified notification push plugin for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) — one minimal `notify()` API in front, 27 channels behind.
+## 相对原插件的实质改动
 
-Your agent and the harness itself both push through it: session events (`turn/end` · `approval/asked` · `agent/error`) auto-notify, the model calls a `notify` tool directly, and six inbound channels bring approvals and conversations back from your phone. v0.3 adds a local web console and multi-agent routing; v0.4 adds native desktop notifications; v0.5 turns your phone into a command center — long-task heartbeats, stall alerts, and a stop button riding the notification itself; v0.7 upgrades "who counts as family" from opaque YAML strings into a runtime identity system — pairing codes, composite-key bindings, and a members page in the admin console — all with zero runtime dependencies.
+### 1. 修复「QQ 推送必然失败」的 bug（本副本存在的首要原因）
 
-## How it works
+**症状**：管理台点「测试通道」成功，但真实通知一条也收不到。
 
-```
-DSH agent ──notify() tool─────────┐
-                                  ├─▶ notifier core ─▶ 27 channels (IM webhooks / push apps / China apps)
-DSH session events ──auto push────┘   level routing · tiered retries · segmentation · anti-disturb · ledger
-                                      heartbeat ⏱ / stall ⚠ (v0.5) ──▶ cards with a ⏹ stop button
-your phone ──6 inbound channels───▶   remote approval (buttons · reply 1/2) · remote conversation (followup/inject/steer)
+**根因**：`v0.12` 起出站配置的唯一运行时真值是 `OutboundSource` 的**深冻结**快照：
+
+```js
+// src/runtime/outbound-source.mjs
+map.set(type, Object.freeze({ type, config: freezeDeep(clone(entry.config)) }))
 ```
 
-Every message resolves through one chain — level (`timeSensitive` / `active` / `passive`) → routing (multi-agent matrix) → channel adapter (`resolve(cfg)` + `send(msg)`). Two trigger lines feed it: the harness auto-pushes session events (debounced, deduped), and the model calls the `notify` tool. Six inbound channels ride the same core in reverse for approvals and conversation — and since v0.5 the outbound line reports back too: long-running turns send heartbeats, silent turns raise stall alerts, and Telegram/Feishu notifications carry a one-click stop action.
+`notify.mjs` 直接把这个已冻结的 `entry.config` 交给适配器：
 
-## Screenshots
+```js
+const sent = await sendOne(type, entry.config, normalized)
+```
 
-The web admin console (`admin.enabled: true`, loopback only, mobile-friendly since v0.5) — all six pages (demo data):
+而适配器把 `resolved` 当作**可变缓存容器**往里挂运行态：
 
-| Page | What it shows |
+```js
+resolved._tokenManager ??= createTokenManager(...)   // ← 严格模式下必抛
+```
+
+于是必抛：
+
+```
+TypeError: Cannot add property _tokenManager, object is not extensible
+```
+
+崩溃发生在第一个 HTTP 请求之前，所以「换 token 失败 / 权限不足」这类提示都看不到，只看到推送无声失败。
+
+**为什么「测试通道」能通过**：`health.mjs` 走的是另一条路径——`adapter.resolve()` 现场新建一个**可变**对象再 `send()`。两条路径对同一份用户配置给出相反结论，这正是最难排查的地方。
+
+**修法**：不再把运行态挂在 `resolved` 上，改用 `WeakMap` 侧表。
+
+```js
+const RUNSTATE = new WeakMap()
+function runStateOf(resolved) {
+  let state = RUNSTATE.get(resolved)
+  if (state === undefined) {
+    state = { tokenManager: undefined, rateGate: undefined, msgSeq: 0 }
+    RUNSTATE.set(resolved, state)
+  }
+  return state
+}
+```
+
+为什么不是「每次 send 现造一份配置」：`qq-bot` 的 token 缓存必须在多次 `send` 之间复用。每发一条都重新换 token，会在 QQ 的 60qpm 限速下迅速触顶。`WeakMap` 以 `resolved` 对象本身为键，配置被热替换后旧键自然被 GC 回收。
+
+同时**保住了**原设计的两条契约：
+- 快照依然深冻结（防消费方篡改）
+- `msg_seq` 依然「全段成功才推进」（失败重试幂等，不重复投递）
+
+顺带修了一个连带问题：`apiBase` 指向自建网关时，换 token 的端点也跟着 `apiBase` 走（原实现写死 `bots.qq.com`，导致自定义 `apiBase` 的配置无法完整联调）。
+
+### 2. 配置完全自持（不读 dsh-notifier）
+
+本插件的**配置唯一来源是自己的配置行**：profile 的 `cordis.patch.yml` 里
+`- id: dsh-notifier-gate` 的 `config`（没写时用 bundle 自带 patch 的默认行，`channels: []`）。
+
+它**不读取、也不借用** `dsh-notifier` 插件的任何配置或状态——两个插件完全独立：
+
+| 项 | 来源 |
 |---|---|
-| **Dashboard** | session stats, outbound/inbound channel health groups, recent audit |
-| **Notifications** (v0.4.0) | live SSE event stream, system-notification preferences, event log |
-| **Members** (v0.7.0) | identity bindings (roles / labels / pairing time), pairing codes, pending-binding confirmations |
-| **Bindings** | agent × channel checkbox grid, per-channel default agent |
-| **Sessions** | per-session outbound resolution with override editing |
-| **Channels** | credential forms for every channel (masked `***`), test send, QR scan |
+| 出站凭证 / 入站凭证 / 各顶层块 | 只有本插件自己的 `- id: dsh-notifier-gate` 配置行 |
+| 持久身份（绑定 / 配对 / 会话路由） | 只有本插件自己的 state（`~/.dsh/dsh-notifier-qq/state.json`） |
 
-![Dashboard](docs/screenshots/admin-dashboard.png)
-![Notify](docs/screenshots/admin-notify.png)
-![Bindings](docs/screenshots/admin-bindings.png)
-![Sessions](docs/screenshots/admin-sessions.png)
-![Channels](docs/screenshots/admin-channels.png)
+`dsh-notifier` 插件即使装着、即使有配置行，对本站也不产生任何影响；反过来本站写 state
+也只在 `dsh-notifier-qq` 目录。启动日志会明确告诉你配置来自哪里：
 
-## Quick start
+```
+[dsh-notifier-qq] 配置来源：本插件配置行（channels: qq-bot；不再读取 dsh-notifier 插件的配置）
+```
+
+配置行里没有任何启用渠道时给出的是可操作的告警（而不是静默无操作）：
+
+```
+[dsh-notifier-qq] 本插件配置行里没有启用任何渠道（channels 为空或全被禁用）：…
+```
+
+> **从旧版升级**：早期版本会自动借用原插件配置，因此只装副本、不写 YAML 也能跑。
+> 现在必须把凭证写进本插件自己的配置行（见下方「配置」一节）。如果之前靠借用跑起来，
+> 升级后照抄一份到 `- id: dsh-notifier-gate` 即可；owner 绑定若只存在于原插件 state，
+> 需用管理台重新配对，或手工把 `inbound:bindings` 等键复制进本插件 state。
+
+> **改名残留说明**：包名已从 `dsh-notifier-qq` 改为 `dsh-notifier-gate`。凡是**按包名匹配**的标识都必须跟着改，否则表现为「装了但不加载」：
+> package.json `name`、`cordis.patch.yml` 的 `id` 与 `insert.name`、`client.js` 里 `__ModuleLoader__.load({ id })`（前端按包名取模块，id 不对就是 `import failed`）、`plugins.bundle.config` / `plugins.bundle.activation` 插槽的 `key`（插件管理器按 `pkg.name` 匹配，key 不对配置页就是空白）。
+>
+> 仍沿用旧名、**故意不改**的运行时标识：默认 state 目录 `~/.dsh/dsh-notifier-qq/`、host↔client 的 RPC 通道 `/dsh-notifier-qq`（`src/control-surface/rpc.mjs` 与 `client.js` 写死同一串，自洽）、面板 `PANEL_ID` 与 locale 命名空间。改这些要两端一起改且会丢现有状态。
+
+---
+
+## 安装
 
 ```bash
-dsh plugin add dsh-notifier --profile <profile-name>
+dsh plugin --profile web add file:/path/to/dsh-notifier-gate
 ```
 
-> `--profile` is required (DSH 0.1.0-rc.6+): plugin installs target a named profile — use the one you run (e.g. `web`).
+或在 profile 的 `package.json` 里加入依赖与 bundle（本机已按此方式装好）：
 
-Add channels to your profile patch (`cordis.patch.yml`):
+```json
+{
+  "dependencies": { "dsh-notifier-gate": "file:~/dsh-notifier-gate" },
+  "dsh": { "profile": { "bundles": ["…", "dsh-notifier-gate"] } }
+}
+```
+
+> 包名、`cordis.patch.yml` 里的 `id` / `name`、以及 profile 覆盖行的 `id` 必须**四处同名**。
+> loader 把 `insert.name` 当模块 specifier 去 `import()`，写成不存在的包名会让整条 bundle
+> 在启动时被静默跳过——插件卡片显示「启动时没能加载」，`node_modules` 里却什么也不缺。
+
+bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**默认行没有任何渠道，装完必须自己写配置**——凭证不再从 `dsh-notifier` 借用。
+
+在 profile 的 `cordis.patch.yml` 里写（config 是**整块替换**，bundle 默认行会被完全覆盖，所以这里要写全）：
 
 ```yaml
-insert:
-  - id: dsh-notifier
-    name: dsh-notifier
-    config:
-      channels:
-        - type: telegram
-          botToken: "123456:ABC-DEF..."
-          chatId: "987654321"
-        - type: dingtalk
-          webhook: "https://oapi.dingtalk.com/robot/send?access_token=..."
-          secret: "SEC..."
-        - type: bark
-          key: "your-device-key"
+- id: dsh-notifier-gate
+  config:
+    channels:
+      - type: qq-bot
+        appId: "你的 appId"
+        appSecret: "你的 appSecret"
+        targetType: user          # user（单聊）| group（群）
+        userId: "目标 openid"
+    inbound:
+      qq:
+        appId: "同 appId"
+        appSecret: "同 appSecret"
 ```
 
-That's it. `turn/end`, `approval/asked`, and `agent/error` events now reach every configured channel, and the model can push on its own with `notify({ message, channel, title })`. Long tasks send heartbeats and stall alerts out of the box (v0.5 defaults), and you can stop a runaway turn right from the notification card.
+---
 
-## Core features
+## 配置项
 
-| Feature | What it does |
-|---|---|
-| **Dual trigger lines** | Auto status push (`turn/end` · `approval/asked` · `agent/error`) plus a model-facing `notify` tool. |
-| **27 channels** | Telegram, Slack, Discord, Feishu, DingTalk, WeCom, WeCom App, QQ bot, OneBot, Teams, Mattermost, Google Chat, Bark, Pushover, PushDeer, Chanify, ntfy, Gotify, iGot, WxPusher, PushPlus, Server酱, Qmsg, 息知, webhook, bell, desktop — zero runtime deps. |
-| **Level routing** | `timeSensitive` / `active` / `passive` → per-channel delivery semantics (silent push, priority headers, @-mentions) with tiered retries. |
-| **Remote approval** | Answer approvals from your phone — Telegram buttons, Feishu cards, QQ / WxPusher / WeChat iLink / DingTalk reply `1`/`2`. Silence never approves. |
-| **Remote conversation** | Chat with your agent: plain text → `followup`/`inject`, `!` prefix steers mid-turn, a merge window reassembles mobile typing. |
-| **Mobile command center** (v0.5.0) | Long-task heartbeats (default 15min start) and stall alerts (default 10min no events); Telegram/Feishu cards carry a ⏹ stop button (HMAC one-time tokens, same trust chain as approvals); `/quiet`·`/unquiet` mute or restore a session's pushes from your phone. |
-| **Open event source** (v0.6.0) | Other plugins push via the `notifier` service (`ctx.inject(['notifier'], …)` — shared config, routing, ledger, rate limits, flush) and subscribe to every broadcast via `ctx.on('dsh-notifier/sent')`. Per-source rate limiting (10/min), 20k-codepoint clamps, never-reject API; consumer contract in [PLUGINS.md](PLUGINS.md). |
-| **Identity system** (v0.7.0) | "Who can drive inbound" becomes a runtime object: pairing codes (`/pair <code>` in any DM; first redeemer becomes owner), composite-key bindings (`channel:userId` — a Telegram-bound id no longer admits a Feishu message), role management (last owner can't be deleted or demoted), and rejection receipts that tell unbound senders how to get in. Empty whitelist boots into a guided state with a bootstrap pairing code on stderr instead of refusing to start. **Full setup-to-daily-use walkthrough: [docs/guide.md](docs/guide.md) (中文)**. |
-| **Multi-agent routing** (v0.3.2) | Bidirectional agent × channel matrix; sessions auto-register; `/agent` command family + `route.mjs` CLI. |
-| **Web admin console** (v0.3.3) | 127.0.0.1-only + Bearer token; six pages — dashboard / notify / members (v0.7) / bindings / sessions / channels; responsive ≤768px layout (v0.5). |
-| **QR login** (v0.3.1) | One-command official scan authorization for QQ / DingTalk / Feishu (WeChat keeps iLink). |
-| **Desktop notifications** (v0.4.0) | Native `desktop` channel (`osascript` / `notify-send` / PowerShell toast) + admin SSE live stream. |
-| **Long-message segmentation** | Over-budget messages split into ordered `（i/n）` segments. |
-| **Anti-disturb rules** | Per-result event gating, keyword include/exclude, idle grace window. |
-| **Ledger & daily digest** | Append-only JSONL ledger + one `passive` summary of yesterday's traffic. |
-| **Secrets safe** | `role('secret')` keys redacted everywhere; `${ENV:NAME}` refs keep secrets out of the profile. |
-| **Never breaks startup** | Misconfigured channels are skipped silently with a log line. |
+### 出站 `channels`（仅 `qq-bot`，一律经 noti-gateway）
 
-## Configuration
+出站**只有一条路径**：统一通知网关。直连 QQ 官方 API 的实现已整体移除，
+网关不可达即本条失败（不存在"静默回退直连"的第二条链路）。
 
-All channels live under `config.channels`. Key example:
-
-```yaml
-insert:
-  - id: dsh-notifier
-    config:
-      channels:
-        - type: telegram
-          botToken: "123456:ABC-DEF..."
-          chatId: "987654321"
-        - type: feishu
-          webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/..."
-        - type: wxpusher
-          appToken: "AT_..."
-          uids: ["UID_..."]
-        - type: serverchan
-          sct: "SCT..."
-```
-
-Optional blocks each opt in under their own key:
-
-| Block | Purpose | Key |
+| 字段 | 必填 | 说明 |
 |---|---|---|
-| `inbound` | Remote approval + conversation | `allowUsers: [...]` (first-import only since v0.7; manage members at runtime via the admin console or `/pair`) |
-| `approval` | Timeout, numbered reply, escalation | `mode: answer` |
-| `conversation` | Merge window, steer prefix | `mergeWindowMs: 1500` |
-| `route` | Multi-agent routing | `sessionTtlHours: 24` |
-| `admin` | Web console | `enabled: true, port: 8104` |
-| `events` / `keywords` / `graceSeconds` | Anti-disturb gates | `exclude: ["heartbeat"]` |
-| `events.turnStart` / `longRunning` / `stall` | v0.5 status line | `longRunning: { firstAfterMs: 900000 }` |
-| `digest` | Ledger + daily summary | `enabled: true` |
+| `type` | ✔ | 固定 `qq-bot` |
+| `gatewayUrl` | ✔ | noti-gateway 地址，如 `http://gateway.example:10086` |
+| `gatewayToken` | ✔ | 网关 `auth.token`（Bearer 鉴权，脱敏） |
+| `gatewaySource` | | 网关侧来源标识，默认 `dsh`，决定配额池归属 |
+| `appId` | | QQ 开放平台开发者 ID——**仅入站网关使用**，出站不再需要 |
+| `appSecret` | | 同页面 AppSecret——**仅入站网关使用** |
+| `targetType` | | `user`（单聊，默认）或 `group`（群聊） |
+| `userId` | | 单聊目标 openid（`targetType: user` 时） |
+| `groupId` | | 群 open id（`targetType: group` 时） |
+| `timeoutMs` | | 单请求超时，默认 `10000` |
 
-v0.5 status line defaults: `longRunning` and `stall` are **on** (15min first heartbeat, then every 15min; stall after 10min of silence) — zero-config long tasks are no longer a black box. `turnStart` is **off** by default (one message per turn is noise at the desk; turn it on when you fire a task and walk away). All timings clamp to a 60s floor; disable any of them with `enabled: false`.
+### 入站 `inbound.qq`
 
-## Channels
+| 字段 | 说明 |
+|---|---|
+| `appId` / `appSecret` | 未填时自动沿用出站 `channels[qq-bot]` 的同名凭证（入站 WS 网关必需） |
+| `notifyUsers` / `notifyGroups` | 限定可交互目标（留空则用配对绑定） |
+| `intents` | 默认 `GROUP_AND_C2C \| INTERACTION` |
 
-<!-- CHANNEL-MATRIX-START -->
+### 其它顶层块
 
-| type | Channel | Auth | Free? |
-|---|---|---|---|
-| `bark` | Bark (iOS) | device key (or self-host URL) | ✅ |
-| `bell` | Terminal bell (local) | — | local |
-| `chanify` | Chanify (iOS) | token (or self-host) | ✅ |
-| `desktop` | Desktop notification (local) | — (Windows needs BurntToast module) | local |
-| `dingtalk` | DingTalk custom robot | webhook + secret (HMAC sign) | ✅ |
-| `discord` | Discord webhook | webhook URL | ✅ |
-| `feishu` | Feishu custom bot | webhook (+ sign secret) | ✅ |
-| `gchat` | Google Chat | space webhook URL | ✅ |
-| `gotify` | Gotify | server URL + app token | self-host |
-| `igot` | iGot (iOS) | push key | ✅ (limits) |
-| `mattermost` | Mattermost | base URL + token (+ channel) | self-host |
-| `ntfy` | ntfy | topic (+ server URL) | ✅ (self-host) |
-| `onebot` | OneBot 11 (QQ) | HTTP endpoint | self-host |
-| `pushdeer` | PushDeer | push key | ✅ |
-| `pushover` | Pushover | user key + app token | paid (one-time) |
-| `pushplus` | PushPlus (WeChat) | token | ✅ (limits) |
-| `qmsg` | Qmsg酱 (QQ) | key + qq number | ✅ (limits) |
-| `qq-bot` | QQ official bot | appId + appSecret | ✅ |
-| `serverchan` | Server酱 (WeChat) | sendkey | ✅ (limits) |
-| `slack` | Slack | incoming webhook URL | ✅ |
-| `teams` | Microsoft Teams | Power Automate workflow URL | ✅ |
-| `telegram` | Telegram Bot API | bot token + chat id | ✅ |
-| `webhook` | Any custom endpoint | — | — |
-| `wecom` | WeCom group robot | webhook key | ✅ |
-| `wecom-app` | WeCom app message | corpid + agentId + secret | ✅ |
-| `wxpusher` | WxPusher (WeChat) | appToken + uid | ✅ (limits) |
-| `xizhi` | 息知 Xizhi | sendkey | ✅ (limits) |
+`approval`（`mode: answer` 远程可决 / `observe` 只旁观）、`events`（哪些事件推送）、`routing`（按 level 分流）、`segment`（长消息分段）、`questions`（远程提问）、`debounceMs`（合并窗口）等，语义与原插件一致。
 
-<!-- CHANNEL-MATRIX-END -->
+---
 
-Six channels also open inbound (remote approval + conversation): `telegram`, `feishu`, `qq-bot`, `wxpusher`, `wechat`, `dingtalk` — long-lived connections or long polling, so no public IP is required (only the WxPusher callback needs one). Since v0.5, telegram and feishu additionally carry notification action cards (stop button). Since v0.7, every inbound channel answers `/help` `/whoami` `/pair` `/unpair` registration commands, and outbound card targets resolve through a three-tier priority (per-channel bindings → channel config lists → global fallback) with per-channel id-shape guards.
+## 事件自动推送与工具
 
-## Architecture
+- **事件推送**：`turnEnd`（完成/失败/中断，可按原因分控）、`approval`（需要批准）、`longRunning`/`stall`（长任务心跳与卡住提醒）等。默认 `turnEnd.completed` 开。
+- **工具**：模型可主动调用 `notify`（发通知）与 `notify_test`（健康自检）。两者都受滑动窗口限流（默认 10 次/分钟），防止把渠道刷成垃圾出口。
+- **远程审批与提问**：QQ 侧用编号回复裁决（`1`/`2`），按钮卡片经 `INTERACTION_CREATE` 回执。
 
-```
-src/
-  adapters/           27 channel adapters (resolve(cfg) + send(msg)) + declarative spec engine
-  config.mjs          channel registry + config schema — single source of truth for the matrix
-  index.mjs           plugin assembly: patch, tools, event listeners, admin wiring
-  event-listener.mjs  auto-push line (debounce, dedup, level routing) + v0.5 status wiring
-  status/             v0.5 turn tracker (heartbeat / stall detection, pure logic)
-  actions.mjs         v0.5 notification action dispatch (turn/cancel, HMAC one-time tokens)
-  notify.mjs          notify / notify_test tools + sliding-window rate limiting
-  routing/            multi-agent matrix (resolveOutbound / resolveInbound)
-  inbound/            six inbound channels (telegram/feishu/qq/wxpusher/wechat/dingtalk) + v0.7 identity stack
-                      (identity.mjs bindings · pairing.mjs codes · commands.mjs registration · target-guard.mjs resolution)
-  approval/           HMAC one-time tokens, dedup, escalation
-  admin/              web console (6 pages, SSE, bearer auth, mobile layout)
-  ledger.mjs          JSONL ledger + daily digest
-  rules.mjs           anti-disturb gates (event / keyword / grace)
-scripts/              channel-login.mjs · test-channel.mjs · route.mjs · gen-channel-matrix.mjs
-test/                 846 tests (node --test)
-```
+---
 
-Design rules: pure ESM (`.mjs`), zero runtime dependencies, a declarative spec engine for the bulk of channels, thin honest adapters, no build step.
+## 日志
 
-## Development
+控制台默认只打**故障**（error/warn），常规生命周期（启动、就绪、事件订阅注册、
+网关会话轮转）只进宿主 logger，不刷终端。
 
-```bash
-npm test          # node --test, 846 cases
-```
+| 环境变量 | 效果 |
+|---|---|
+| （不设） | 默认：`error`/`warn` 双写控制台；`info`/`debug` 仅 logger |
+| `DSH_NOTIFIER_VERBOSE=1` | 连 `info` 也打到控制台（排障用） |
+| `DSH_NOTIFIER_VERBOSE=0` | 完全关闭 stderr 双写，只走 logger |
 
-To add a channel: implement the adapter interface (`resolve(cfg)` + `send(msg)`) in `src/adapters/` and register it in `src/config.mjs`; the channel matrix above self-regenerates via `node scripts/gen-channel-matrix.mjs`.
+> 曾经的做法是「所有 warn 都双写 stderr」——那是为了救 2026-08-16 一次真机事故
+> （宿主 logger 不落 stdout，inbound 全死却零可见）。代价是终端被启动装配与
+> 会话轮转刷屏。现在把「一定可见」的承诺只留给真故障。
 
-## License
+## 排障
 
-[MIT](LICENSE) · third-party notices in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 通知静默不到 | 未开通「单聊/群主动消息」权限 | q.qq.com → 机器人 → 开发设置，开启对应场景权限 |
+| 日志 `本插件配置行里没有启用任何渠道` | 本插件自己的 `- id: dsh-notifier-gate` 配置行没有 `channels`，或行内渠道被 `enabled: false` | 在 profile 的 `cordis.patch.yml` 里为该行补 `channels` |
+| 日志 `qq-bot 未配置：gatewayUrl / gatewayToken 未填写` | 出站网关没配全 | 在 `channels[qq-bot]` 补 `gatewayUrl` 与 `gatewayToken` |
+| 日志 `网关投递失败` | noti-gateway 不可达 / token 错 | 核对 `gatewayUrl` 连通性与 `gatewayToken`；**不会回退直连** |
+| 日志 `QQ 网关闭码 4009 / 服务端要求重连（op7）` | QQ 平台常规会话轮转，非故障 | 只首次打 warn，后续降 debug；如频繁且收不到消息再查机器人登录态 |
+| 日志 `qq-bot 返回错误 <code>` | 凭证错 / 目标 openid 失效 / 被限流 | 按错误码到开放平台核对 |
+| 只看到「换 token 失败」 | appId / appSecret 不匹配 | 核对开发设置页 |
+| 工具报 `returned invalid output: value is not lossless JSON` | 已修复（0.13.1-qq.2）：旧版在未传 `channel` 时返回 `channel: undefined` | 升级到本版 |
+| 插件卡片显示「启动时没能加载」 | `cordis.patch.yml` 的 `id`/`name` 与 package.json 包名不一致 | 三处同名（见「安装」） |
+
+**验证是否真的修好**：用 `notify_test` 工具发一条，并在 QQ 侧确认实收。**不要只用管理台「测试通道」判断**——那条路径不经过冻结快照，原插件在它上面永远是绿的。
+
+---
+
+## 裁剪范围
+
+- 模块：120 → 85（`config.mjs` 只留 `qq-bot` 注册表；入站 `INBOUND_CHANNELS` 只剩 `qq`；五个渠道适配器、五个入站 transport、扫码流、声明表引擎全部移除）。
+- 无死代码：从 `src/plugin-entry.mjs` 出发可达性分析，全部可达。
+- 运行时依赖：0（不再需要读 YAML——配置由宿主 cordis 解析后作为 `config` 传入；原先用于读原插件 patch 的 `src/compat/` 已随「配置自持」一并移除）。
+
+---
+
+## 许可
+
+MIT。核心逻辑来自 [`dsh-notifier`](https://github.com/THEWOLFWALKER/dsh-notifier)（MIT），第三方声明见 `THIRD_PARTY_NOTICES.md`。

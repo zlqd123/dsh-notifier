@@ -5,46 +5,52 @@
 // 「昨晚 3 条通知：✅ x2、❌ x1」——不用翻手机通知流。
 
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+// lang 文案表：晨报正文取词；分类标记 zh/en 双语都匹配（与推送语言无关）
+import { stringsOf } from './strings.mjs'
 
-/** 标题 → 事件种类（intentToMessage 的标题前缀约定；含 titlePrefix 也能子串命中）。 */
+/** 标题 → 事件种类（intentToMessage 的标题前缀约定；含 titlePrefix 也能子串命中）。
+ *  zh/en 双标记都匹配：分类与推送语言无关（lang:'en' 时英文 headline 也入正确桶）。 */
 const KIND_PATTERNS = [
-  ['digest', '通知摘要'],
-  ['completed', '任务完成'],
-  ['error', '任务出错'],
-  ['agentError', 'Agent 执行出错'],
-  ['blocked', '任务被阻塞'],
-  ['aborted', '任务已中止'],
-  ['maxTokens', '达到 Token 上限'],
-  ['interrupted', '任务异常中断'],
-  ['approval', '需要你批准'],
+  ['digest', ['通知摘要', 'Notification digest']],
+  ['completed', ['任务完成', 'Task complete']],
+  ['error', ['任务出错', 'Task failed']],
+  ['agentError', ['Agent 执行出错', 'Agent error']],
+  ['blocked', ['任务被阻塞', 'Task blocked']],
+  ['aborted', ['任务已中止', 'Task aborted']],
+  ['maxTokens', ['达到 Token 上限', 'Output token limit reached']],
+  ['interrupted', ['任务异常中断', 'Task interrupted']],
+  ['approval', ['需要你批准', 'Approval needed']],
 ]
 
 /** 从通知标题推断事件种类；未知回 'other'（用户/工具自定义通知）。 */
 export function classifyTitle(title) {
   const value = typeof title === 'string' ? title : ''
-  for (const [kind, marker] of KIND_PATTERNS) {
-    if (value.includes(marker)) return kind
+  for (const [kind, markers] of KIND_PATTERNS) {
+    for (const marker of markers) {
+      if (value.includes(marker)) return kind
+    }
   }
   return 'other'
 }
 
-/** 组装摘要正文（中文，一行统计 + 失败渠道提示）。 */
-export function composeDigest(summary) {
+/** 组装摘要正文（一行统计 + 失败渠道提示；strings 缺省 zh 文案表，既有调用方零感知）。 */
+export function composeDigest(summary, strings = stringsOf()) {
   const { from, to, counts, failedDeliveries } = summary
-  const lines = [`时间窗：${from} ~ ${to}，共 ${counts.total} 条通知`]
+  const d = strings.digest
+  const lines = [d.windowLine(from, to, counts.total)]
   const parts = []
-  if (counts.completed > 0) parts.push(`✅完成 x${counts.completed}`)
-  if (counts.error > 0) parts.push(`❌出错 x${counts.error}`)
-  if (counts.agentError > 0) parts.push(`❌agent出错 x${counts.agentError}`)
-  if (counts.blocked > 0) parts.push(`🚫阻塞 x${counts.blocked}`)
-  if (counts.aborted > 0) parts.push(`⏹中止 x${counts.aborted}`)
-  if (counts.maxTokens > 0) parts.push(`⚠️token上限 x${counts.maxTokens}`)
-  if (counts.interrupted > 0) parts.push(`⏸中断 x${counts.interrupted}`)
-  if (counts.approval > 0) parts.push(`🔐审批 x${counts.approval}`)
-  if (counts.other > 0) parts.push(`其他 x${counts.other}`)
-  if (parts.length > 0) lines.push(parts.join('、'))
-  if (failedDeliveries > 0) lines.push(`另有 ${failedDeliveries} 条渠道投递失败（详见日志）`)
-  if (counts.total === 0) return `时间窗：${from} ~ ${to}，无通知记录`
+  if (counts.completed > 0) parts.push(d.completed(counts.completed))
+  if (counts.error > 0) parts.push(d.error(counts.error))
+  if (counts.agentError > 0) parts.push(d.agentError(counts.agentError))
+  if (counts.blocked > 0) parts.push(d.blocked(counts.blocked))
+  if (counts.aborted > 0) parts.push(d.aborted(counts.aborted))
+  if (counts.maxTokens > 0) parts.push(d.maxTokens(counts.maxTokens))
+  if (counts.interrupted > 0) parts.push(d.interrupted(counts.interrupted))
+  if (counts.approval > 0) parts.push(d.approval(counts.approval))
+  if (counts.other > 0) parts.push(d.other(counts.other))
+  if (parts.length > 0) lines.push(parts.join(d.joiner))
+  if (failedDeliveries > 0) lines.push(d.failedLine(failedDeliveries))
+  if (counts.total === 0) return d.empty(from, to)
   return lines.join('\n')
 }
 
@@ -57,10 +63,21 @@ export function composeDigest(summary) {
  */
 export function createLedger(options = {}) {
   const dir = typeof options.dir === 'string' && options.dir !== '' ? options.dir : '.'
-  const maxEntries = Math.max(50, Math.trunc(options.maxEntries ?? 500))
+  // v0.12.1（P1-22）：非法/无穷配置不能把 prune 判据退化成 NaN 或 Infinity。
+  const rawMaxEntries = Number(options.maxEntries)
+  const maxEntries = Number.isFinite(rawMaxEntries)
+    ? Math.min(100_000, Math.max(50, Math.trunc(rawMaxEntries)))
+    : 500
   const now = options.now ?? Date.now
   const file = `${dir}/ledger.jsonl`
   const stateFile = `${dir}/ledger-state.json`
+  // v0.13（A09）：重启后沿用现有文件规模，避免 entryCount 从 0 重新计数导致 prune 永不触发。
+  let entryCount = 0
+  try {
+    if (existsSync(file)) {
+      entryCount = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() !== '').length
+    }
+  } catch { entryCount = 0 }
 
   const ensureDir = () => {
     try { mkdirSync(dir, { recursive: true }) } catch { /* 已存在或不可写：append 时自然暴露 */ }
@@ -85,6 +102,7 @@ export function createLedger(options = {}) {
       // v0.6.3：对齐 store 的 0600 军规（审查 R1 P1-3）——账本行含通知标题/错误摘要
       // （可能带任务路径与审批上下文），共享主机上不应其他账号可读。失败尽力而为。
       try { chmodSync(file, 0o600) } catch { /* Windows/受限环境无 chmod */ }
+      entryCount += 1
       maybePrune()
     } catch { /* 磁盘满/权限问题：静默，推送不受影响 */ }
   }
@@ -92,13 +110,19 @@ export function createLedger(options = {}) {
   /** 超过 2 倍上限时重写保留最新 maxEntries 条（摊销 O(n)，日常零开销）。 */
   function maybePrune() {
     try {
+      // 先用实例级计数判定，常态 append 不再同步全量读取 ledger。
+      if (entryCount <= maxEntries * 2) return
       const lines = readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() !== '')
-      if (lines.length <= maxEntries * 2) return
+      if (lines.length <= maxEntries * 2) {
+        entryCount = lines.length
+        return
+      }
       const kept = lines.slice(-maxEntries)
       const tmp = `${file}.tmp`
       writeFileSync(tmp, `${kept.map((line) => `${line}\n`).join('')}`)
       try { chmodSync(tmp, 0o600) } catch { /* Windows/受限环境无 chmod */ }
       renameSync(tmp, file)
+      entryCount = kept.length
     } catch { /* 重写失败：下次再试，绝不致命 */ }
   }
 
@@ -136,6 +160,35 @@ export function createLedger(options = {}) {
     return { counts, failedDeliveries, from: fromLabel ?? new Date(fromMs).toISOString(), to: toLabel ?? new Date(toMs).toISOString() }
   }
 
+  /**
+   * 最近 limit 条账本记录（Commit20 /log 的唯一数据源；**只读**、有界、绝不抛）。
+   * - 从文件尾向前收集，天然取「最新 N 条」并返回**正序**（旧→新，便于按时间阅读）；
+   * - 脏行（非 JSON / 非对象）逐条跳过——账本容错优先于完整，与 read() 同口径；
+   * - 返回 copy-on-read（每条 JSON 深拷贝）：调用方改返回值绝不污染内部/盘上数据；
+   * - 账本自身有 maxEntries 上限且 prune，故 full read 可接受（plan §11.12）。
+   */
+  function recent(limit = 20) {
+    try {
+      const n = Math.max(0, Math.trunc(Number(limit) || 0))
+      if (n === 0 || !existsSync(file)) return []
+      const lines = readFileSync(file, 'utf8').split('\n')
+      const out = []
+      for (let index = lines.length - 1; index >= 0 && out.length < n; index -= 1) {
+        const line = lines[index]
+        if (line.trim() === '') continue
+        try {
+          const entry = JSON.parse(line)
+          if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+          out.push(JSON.parse(JSON.stringify(entry)))
+        } catch { /* 脏行跳过 */ }
+      }
+      out.reverse()
+      return out
+    } catch {
+      return []
+    }
+  }
+
   /** 摘要去重标记：同一天只发一次晨报（重启不重发）。 */
   function markDigestDone(dateStr) {
     try {
@@ -152,7 +205,7 @@ export function createLedger(options = {}) {
     }
   }
 
-  return { append, read, summarize, compose: composeDigest, markDigestDone, lastDigestDate, get file() { return file } }
+  return { append, read, summarize, recent, compose: composeDigest, markDigestDone, lastDigestDate, get file() { return file } }
 }
 
 /**

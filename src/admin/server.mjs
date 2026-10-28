@@ -11,6 +11,8 @@
 // 军规：任何请求处理异常绝不崩进程；请求体上限 1MB（超限 413）；stop() 幂等（二次调用不抛）。
 
 import { createServer } from 'node:http'
+import { createLog } from '../log.mjs'
+import { diagnosticErrorMessage } from '../security/diagnostic.mjs'
 
 const MAX_BODY_BYTES = 1024 * 1024
 const JSON_TYPE = 'application/json; charset=utf-8'
@@ -52,40 +54,122 @@ function apiStatusOf(error) {
  * 创建 Web 管理台服务器（构造即建 server，listen 由 start() 触发）。
  * @param {object} options
  * @param {object} options.api - 管理台 API（overview/getBindings/putBindings/getSessions/patchSession/
- *                               getChannels/putChannel/testChannel/scanChannel/getMembers/
+ *                               patchSessionControl/getChannels/putChannel/testChannel/scanChannel/getMembers/
  *                               putMember/deleteMember/confirmPendingMember/dismissPendingMember/
- *                               mintPairingCode/revokePairingCode/getAudit）
+ *                               mintPairingCode/revokePairingCode/getPendingQuestions/settleQuestion/
+ *                               getAudit/getTasks/getHostCapabilities）
  * @param {(token: string) => boolean} options.verifyToken - Bearer token 校验（严格 === true 才放行）
+ * @param {() => { token: string, expiresAt?: number }} [options.createSession] - 一次性票据兑换后的短会话创建器
+ * @param {(token: string) => boolean} [options.verifySession] - HttpOnly 浏览器会话校验器
  * @param {string} [options.host='127.0.0.1'] - 只绑本机回环（红线：永不绑公网）
  * @param {number} [options.port=8104] - 监听端口；0 = 随机可用端口（测试用）
  * @param {string} [options.ui=''] - 单文件内嵌 HTML 串（空串时 GET / 返回最小占位页）
  * @param {object} [options.events] - 通知事件 hub（admin/events.mjs；提供 subscribe/publish）；
  *                                    未注入时 GET /api/events 回 501（能力不可用语义同 ApiError）
  * @param {number} [options.heartbeatMs=15000] - SSE 心跳间隔（测试注入小值）
+ * @param {string[]} [options.allowedOrigins=[]] - S-06 额外放行的 Origin（反代/HTTPS 场景，
+ *                                                如 'https://admin.example.com'；回环默认自动放行）
+ * @param {string[]} [options.allowedHosts=[]] - S-06 额外放行的 Host 头（公网反代场景，
+ *                                               如 'admin.example.com'；回环默认自动放行）
  * @param {object} [options.logger] - { warn(message) } 注入；日志失败绝不致命
  * @returns {{ start: () => Promise<{ port: number, address: string }>,
  *             stop: () => Promise<void>,
  *             get port(): number | null }}
  */
-export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port = 8104, ui = '', events = null, heartbeatMs = DEFAULT_HEARTBEAT_MS, logger } = {}) {
-  const warn = (message) => {
-    // stderr 双写（R5 审查 R5-2-P1-2：与 api.mjs 同款纪律，web profile 下 logger 不落 stdout）
-    try { logger?.warn?.('[dsh-notifier/admin:server]', message) } catch { /* 日志失败绝不致命 */ }
-    try { console.error('[dsh-notifier/admin:server]', message) } catch { /* 控制台不可用不致命 */ }
-  }
+export function createAdminServer({ api, verifyToken, verifyLaunchTicket = null, createSession = null, verifySession = null, host = '127.0.0.1', port = 8104, ui = '', events = null, heartbeatMs = DEFAULT_HEARTBEAT_MS, allowedOrigins = [], allowedHosts = [], logger } = {}) {
+  const log = createLog({ logger, tag: '[dsh-notifier-gate/admin:server]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
   const htmlPage = ui === '' ? FALLBACK_UI : String(ui)
+
+  // ---- S-06（CWE-352/942）Origin/Host 第二道纵深 ----
+  // Bearer 模型下浏览器不自动附带凭证（token 在 sessionStorage），经典 CSRF 难利用——
+  // 但「host 改 0.0.0.0/反代公网 + token 被钓」场景缺第二道防线：
+  //  - Origin 头存在时必须在白名单（浏览器跨站请求必带；curl 等非浏览器客户端不带 → 放行，
+  //    由 Bearer 鉴权兜底）；
+  //  - Host 头必须在白名单（防 DNS rebinding：受害者浏览器被解析到 127.0.0.1 时
+  //    Host 是攻击者域名，缺这道闸时同源策略完全失守）。
+  // 回环绑定（127.0.0.1/localhost）自动放行 127.0.0.1/localhost/[::1] 三形态（带不带端口、
+  // http/https 两种 Origin scheme 都接受——本机反代 TLS 终止是合法形态）；公网/反代
+  // 场景由 allowedOrigins/allowedHosts 显式注入。端口用实际监听值（port=0 测试随机分配）。
+  const extraOrigins = (Array.isArray(allowedOrigins) ? allowedOrigins : []).map((value) => String(value).trim()).filter((value) => value !== '')
+  const extraHostHeaders = (Array.isArray(allowedHosts) ? allowedHosts : []).map((value) => String(value).trim().toLowerCase()).filter((value) => value !== '')
+  const loopbackBind = host === '127.0.0.1' || host === 'localhost' || host === '::1'
+  const hostVariants = loopbackBind ? ['127.0.0.1', 'localhost', '[::1]', '::1'] : [host]
+
+  /** 按实际监听端口构建当次请求的 Origin/Host 白名单（listen 前 port=0 时只比 extras）。 */
+  function buildGateAllowlist() {
+    const actualPort = listenInfo?.port ?? port
+    const hosts = new Set(extraHostHeaders)
+    const origins = new Set(extraOrigins)
+    for (const variant of hostVariants) {
+      hosts.add(variant)
+      hosts.add(`${variant}:${actualPort}`)
+      origins.add(`http://${variant}:${actualPort}`)
+      origins.add(`https://${variant}:${actualPort}`)
+      if (loopbackBind) {
+        // 无端口形态：反代剥端口 / HTTP/1.0 客户端；仅回环绑定接受（公网绑定必须精确）
+        hosts.add(variant)
+        origins.add(`http://${variant}`)
+        origins.add(`https://${variant}`)
+      }
+    }
+    return { hosts, origins }
+  }
+
+  /**
+   * S-06 请求闸：Origin（存在时）与 Host 必须命中白名单。
+   * @returns {true | 'origin' | 'host'} 放行返回 true，否则返回被拒的头名。
+   */
+  function gateCheck(request) {
+    const origin = typeof request.headers.origin === 'string' ? request.headers.origin.trim() : ''
+    if (origin !== '' && !buildGateAllowlist().origins.has(origin)) return 'origin'
+    const hostHeader = typeof request.headers.host === 'string' ? request.headers.host.trim().toLowerCase() : ''
+    if (hostHeader === '' || !buildGateAllowlist().hosts.has(hostHeader)) return 'host'
+    return true
+  }
 
   // 路由表（段匹配：':name' 匹配任意非空单段；先收集同路径全部方法再分派 → 405 可判定）。
   const routes = [
     { method: 'GET', segments: [], html: true, handler: () => htmlPage },
+    { method: 'POST', segments: ['api', 'auth', 'exchange-ticket'], public: true, handler: ({ body }) => {
+      if (typeof verifyLaunchTicket !== 'function' || verifyLaunchTicket(body?.ticket) !== true) {
+        const error = new Error('启动票据无效或已过期')
+        error.status = 401
+        throw error
+      }
+      if (typeof createSession !== 'function') return { accepted: true }
+      const session = createSession()
+      if (session === null || typeof session !== 'object' || typeof session.token !== 'string' || session.token === '') {
+        const error = new Error('管理台会话创建失败')
+        error.status = 503
+        throw error
+      }
+      const seconds = Number.isFinite(session.expiresAt)
+        ? Math.max(1, Math.ceil((session.expiresAt - Date.now()) / 1000))
+        : 300
+      return {
+        accepted: true,
+        __setCookie: `dsh_notifier_session=${encodeURIComponent(session.token)}; Max-Age=${seconds}; Path=/; HttpOnly; SameSite=Strict`,
+      }
+    } },
     { method: 'GET', segments: ['api', 'overview'], handler: () => api.overview() },
     { method: 'GET', segments: ['api', 'bindings'], handler: () => api.getBindings() },
     { method: 'PUT', segments: ['api', 'bindings'], handler: ({ body }) => api.putBindings(body) },
     { method: 'GET', segments: ['api', 'sessions'], handler: () => api.getSessions() },
     { method: 'PATCH', segments: ['api', 'sessions', ':id'], handler: ({ params, body }) => api.patchSession(params.id, body) },
+    { method: 'PATCH', segments: ['api', 'sessions', ':id', 'control'], handler: ({ params, body }) => api.patchSessionControl(params.id, body) },
     { method: 'GET', segments: ['api', 'channels'], handler: () => api.getChannels() },
     { method: 'PUT', segments: ['api', 'channels', ':type'], handler: ({ params, body }) => api.putChannel(params.type, body.config ?? body) },
     { method: 'POST', segments: ['api', 'channels', ':type', 'test'], handler: ({ params }) => api.testChannel(params.type) },
+    // 零配置首访（admin-zero-config-onboarding）：方向明确的通道路由（段数与旧路由不同，
+    // 天然无冲突）。出站写 admin:channel:<type>:outbound；入站写 <type>:account；
+    // 出站即时测试读取最新 YAML+state 合并配置（保存后无需重启即可真测）。
+    { method: 'PUT', segments: ['api', 'channels', 'outbound', ':type'], handler: ({ params, body }) => api.putOutboundChannel(params.type, body.config ?? body) },
+    { method: 'DELETE', segments: ['api', 'channels', 'outbound', ':type'], handler: ({ params }) => api.deleteOutboundChannel(params.type) },
+    { method: 'POST', segments: ['api', 'channels', 'outbound', ':type', 'test'], handler: ({ params }) => api.testOutboundChannel(params.type) },
+    { method: 'PUT', segments: ['api', 'channels', 'inbound', ':type'], handler: ({ params, body }) => api.putInboundChannel(params.type, body.config ?? body) },
+    { method: 'DELETE', segments: ['api', 'channels', 'inbound', ':type'], handler: ({ params }) => api.deleteInboundChannel(params.type) },
     { method: 'POST', segments: ['api', 'scan', ':channel'], handler: ({ params }) => api.scanChannel(params.channel) },
     // v0.7 成员与配对码（键形 "<channel>:<userId>"，冒号在路径段内合法——decodeSegment 已解 %3A）
     { method: 'GET', segments: ['api', 'members'], handler: () => api.getMembers() },
@@ -96,6 +180,13 @@ export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port =
     { method: 'POST', segments: ['api', 'pairing'], handler: ({ body }) => api.mintPairingCode(body) },
     { method: 'DELETE', segments: ['api', 'pairing', ':id'], handler: ({ params }) => api.revokePairingCode(params.id) },
     { method: 'GET', segments: ['api', 'audit'], handler: () => api.getAudit() },
+    // 路线图阶段 2A：远程提问管理台裁决（2026-08-26）。GET 只读脱敏快照；
+    // POST :ref/settle 走收件人识别的受保护结算（授权在 Control Core + bearer 层）
+    { method: 'GET', segments: ['api', 'questions'], handler: () => api.getPendingQuestions() },
+    { method: 'POST', segments: ['api', 'questions', ':ref', 'settle'], handler: ({ params, body }) => api.settleQuestion({ ...(body ?? {}), ref: params.ref }) },
+    // v0.10 提交7：管理台暴露 DSH 连接与任务状态（只读；数据源 = 任务投影 + 宿主能力快照）
+    { method: 'GET', segments: ['api', 'tasks'], handler: () => api.getTasks() },
+    { method: 'GET', segments: ['api', 'host'], handler: () => api.getHostCapabilities() },
     { method: 'GET', segments: ['api', 'events'], sse: true }, // v0.4.0 通知事件流（handle 内特判）
   ]
 
@@ -130,19 +221,24 @@ export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port =
   }
 
   /**
-   * Bearer 鉴权：头缺失 / 非 `Bearer <token>` 格式 / verifyToken 非 true / 校验抛异常，一律 false。
+   * Bearer 鉴权为恢复通道；浏览器首访兑换后的短会话走 HttpOnly cookie。
    * @param {import('node:http').IncomingMessage} request
    * @returns {boolean}
    */
   function authorized(request) {
     try {
       const header = request.headers.authorization
-      if (typeof header !== 'string') return false
-      const match = /^Bearer (.+)$/.exec(header)
+      if (typeof header === 'string') {
+        const match = /^Bearer (.+)$/.exec(header)
+        if (match !== null && verifyToken(match[1]) === true) return true
+      }
+      if (typeof verifySession !== 'function') return false
+      const cookieHeader = typeof request.headers.cookie === 'string' ? request.headers.cookie : ''
+      const match = /(?:^|;\s*)dsh_notifier_session=([^;]+)/.exec(cookieHeader)
       if (match === null) return false
-      return verifyToken(match[1]) === true
+      return verifySession(decodeURIComponent(match[1])) === true
     } catch {
-      return false // verifyToken 自身异常按未授权处理，绝不冒泡
+      return false // 校验器自身异常按未授权处理，绝不冒泡
     }
   }
 
@@ -253,13 +349,20 @@ export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port =
    * @param {import('node:http').ServerResponse} response
    */
   async function handle(request, respond, response) {
+    // S-06 请求闸先于路由与鉴权（403 不泄露路由存在性；被拒请求也不消耗 api 配额）。
+    const gate = gateCheck(request)
+    if (gate !== true) {
+      warn(`请求被 Origin/Host 闸拒绝（${gate} 头不在白名单）`)
+      return respond.json(403, { error: '请求被拒绝：Origin/Host 校验未通过' })
+    }
     const rawPath = String(request.url ?? '').split('?')[0]
     const pathname = rawPath.startsWith('/') ? rawPath : `/${rawPath}`
     const method = String(request.method ?? 'GET').toUpperCase()
     const segments = pathname === '/' ? [] : pathname.slice(1).split('/').map(decodeSegment)
     const { allowed, matched } = matchRoute(method, segments)
 
-    if (segments[0] === 'api' && !authorized(request)) {
+    const publicRoute = matched?.route?.public === true
+    if (segments[0] === 'api' && !publicRoute && !authorized(request)) {
       return respond.json(401, { error: '鉴权失败：缺少或错误的 Bearer token' })
     }
     if (matched === null) {
@@ -288,28 +391,36 @@ export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port =
     try {
       result = await matched.route.handler({ params: matched.params, body, request })
     } catch (error) {
-      const status = apiStatusOf(error)
-      if (status !== null) return respond.json(status, { error: String(error.message ?? '') })
-      warn(`api 处理异常: ${error instanceof Error ? error.message : String(error)}`)
+      const status = apiStatusOf(error) ?? (Number.isInteger(error?.status) ? error.status : null)
+      if (status !== null) return respond.json(status, { error: diagnosticErrorMessage(error) })
+      warn(`api 处理异常: ${diagnosticErrorMessage(error)}`)
       return respond.json(500, { error: '内部错误' }) // 堆栈只进日志，绝不回给客户端
     }
     if (matched.route.html) return respond.html(200, String(result))
-    respond.json(200, result === undefined ? {} : result)
+    let payload = result === undefined ? {} : result
+    let headers
+    if (payload !== null && typeof payload === 'object' && typeof payload.__setCookie === 'string') {
+      const cookie = payload.__setCookie
+      payload = { ...payload }
+      delete payload.__setCookie
+      headers = { 'set-cookie': cookie }
+    }
+    respond.json(200, payload, headers)
   }
 
   const server = createServer((request, response) => {
     let responded = false // 413 destroy 与后续事件可能竞态：只允许写一次响应
-    const write = (status, payload, contentType) => {
+    const write = (status, payload, contentType, headers = {}) => {
       if (responded) return
       responded = true
       const body = typeof payload === 'string' ? payload : JSON.stringify(payload === undefined ? {} : payload)
       try {
-        response.writeHead(status, { 'content-type': contentType, 'content-length': Buffer.byteLength(body) })
+        response.writeHead(status, { 'content-type': contentType, 'content-length': Buffer.byteLength(body), ...headers })
         response.end(body)
       } catch { /* 响应写失败（客户端已断）：绝不向上抛 */ }
     }
     const respond = {
-      json: (status, payload) => write(status, payload, JSON_TYPE),
+      json: (status, payload, headers) => write(status, payload, JSON_TYPE, headers),
       html: (status, text) => write(status, text, HTML_TYPE),
       taken: () => { responded = true }, // SSE 流接管响应：一次性写通道让位（幂等闸防双写）
     }
@@ -336,25 +447,40 @@ export function createAdminServer({ api, verifyToken, host = '127.0.0.1', port =
   let listenPromise = null
   let closePromise = null
 
-  /** 启动监听（幂等）；resolve 实际 { port, address }（port 0 时为内核分配的随机端口）。 */
+  /** 启动监听（幂等）；resolve 实际 { port, address }（port 0 时为内核分配的随机端口）。
+   * 零配置首访（admin-zero-config-onboarding）：首选端口被占用时自动回退到系统分配的
+   * 空闲端口（port: 0），仍只绑定 127.0.0.1，并打印实际监听地址。回退在同一个 server
+   * 生命周期内完成——listen 失败时先 close 清理半启动状态，再以 port=0 重新 listen。
+   * Origin/Host allowlist 使用实际端口（buildGateAllowlist 读取 listenInfo?.port）。 */
   function start() {
     if (listenPromise !== null) return listenPromise
     listenPromise = new Promise((resolve, reject) => {
+      let fallbackAttempted = false
       const onListenError = (error) => {
-        listenPromise = null
-        reject(error) // listen 失败（端口占用等）要向上抛
-      }
-      server.once('error', onListenError)
-      server.listen(port, host, () => {
-        server.removeListener('error', onListenError)
-        const address = server.address()
-        listenInfo = {
-          port: typeof address === 'object' && address !== null ? address.port : port,
-          address: typeof address === 'object' && address !== null ? address.address : host,
+        if (!fallbackAttempted && error?.code === 'EADDRINUSE') {
+          fallbackAttempted = true
+          warn(`首选端口 ${port} 已被占用，自动回退到系统分配端口（仅本机回环）`)
+          // 清理半启动状态：close 忽略错误（未 listen 时回调带错），然后以 port=0 重试
+          try { server.close(() => { doListen(0) }) } catch { doListen(0) }
+          return
         }
-        warn(`admin 管理台已监听 ${listenInfo.address}:${listenInfo.port}（仅本机回环，永不绑公网）`)
-        resolve({ ...listenInfo })
-      })
+        listenPromise = null
+        reject(error) // listen 失败（非端口占用或回退后仍失败）要向上抛
+      }
+      function doListen(listenPort) {
+        server.once('error', onListenError)
+        server.listen(listenPort, host, () => {
+          server.removeListener('error', onListenError)
+          const address = server.address()
+          listenInfo = {
+            port: typeof address === 'object' && address !== null ? address.port : listenPort,
+            address: typeof address === 'object' && address !== null ? address.address : host,
+          }
+          warn(`admin 管理台已监听 ${listenInfo.address}:${listenInfo.port}（仅本机回环，永不绑公网）`)
+          resolve({ ...listenInfo })
+        })
+      }
+      doListen(port)
     })
     return listenPromise
   }

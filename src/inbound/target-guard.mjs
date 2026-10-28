@@ -19,6 +19,8 @@
 /**
  * 各渠道 id 形态（null = 无已知形态，一律放行）。
  */
+import { INBOUND_CHANNELS, INBOUND_CHANNEL_SET } from './channels-registry.mjs'
+
 const CHANNEL_ID_PATTERNS = {
   telegram: /^-?\d{1,16}$/,
   feishu: /^(ou|oc|on)_[A-Za-z0-9]+$/,
@@ -28,15 +30,53 @@ const CHANNEL_ID_PATTERNS = {
   dingtalk: /^[A-Za-z0-9._-]{4,64}$/,
 }
 
-/** 渠道 id 形态是否可信（未知渠道 fail-open 放行——守卫不是白名单）。 */
+/** 渠道 id 形态是否可信（S-12：未知渠道 fail-closed 拒绝——枚举收敛到 channels-registry 后，未知渠道只剩拼写错误或上游漂移两种来源，都不该放行）。 */
 export function isValidTargetId(channel, id) {
+  if (!INBOUND_CHANNEL_SET.has(String(channel ?? ''))) return false
   const pattern = CHANNEL_ID_PATTERNS[String(channel ?? '')]
-  if (pattern === undefined) return true
+  if (pattern === undefined) return true // 已登记渠道暂无形态表：宁放过不错杀（错杀真成员是 P1）
   return pattern.test(String(id ?? ''))
 }
 
 /**
+ * Feishu 用户 open_id 形态（ou_*，私聊投递目标；P0-Feishu-P2P #20）。
+ * 私聊发送用 receive_id_type=open_id，账本/pushedTo/卡片 srcChat 记的都是 ou_*；
+ * 而点击/回复事件的会话 id 是 P2P 会话 chat_id（oc_*）——来源身份（ou_）与投递
+ * 寻址（oc_）是两套 id 空间，判定归属时不可直接字符串比对。
+ */
+export function isOpenIdTarget(channel, id) {
+  return String(channel ?? '') === 'feishu' && /^ou_[A-Za-z0-9]+$/.test(String(id ?? ''))
+}
+
+/**
+ * Feishu P2P 会话等价（P0-Feishu-P2P #20：来源身份 vs 投递寻址分离）。
+ * 私聊投递记录的目标是用户 open_id（ou_*），事件会话 id 是 P2P 会话 chat_id
+ * （oc_*，chat_type='p2p'）。当「事件确为私聊 + 事件操作者与投递目标同人」时，
+ * 两者视为同一私聊会话。其余情况（其他渠道、群聊、缺 chatType、user 不一致）
+ * 一律退化为直接字符串相等——行为与旧实现逐字节一致，群聊跨会话转发保持 fail-closed。
+ * 该规则只用于「同一私聊」的归属判定，绝不泛化到 QQ/TG/群聊（#20 红线）。
+ * @param {string} channel
+ * @param {string} a - 投递记录里的 chatId（pushedTo / hintTargets）
+ * @param {string} b - 事件里的 chatId（envelope / 回调）
+ * @param {{ userId?: string, targetUserId?: string, chatType?: string }} [ctx]
+ *   - userId/targetUserId：事件操作者 id 与投递目标 id（P2P 同人判定的安全边界）
+ *   - chatType：事件会话类型（'p2p' 才可能等价；缺失/非 p2p 一律不等价）
+ */
+export function feishuP2pEquivalent(channel, a, b, { userId, targetUserId, chatType } = {}) {
+  const A = String(a ?? '')
+  const B = String(b ?? '')
+  if (A !== '' && A === B) return true
+  if (String(channel ?? '') !== 'feishu') return false
+  if (!A.startsWith('ou_') || !B.startsWith('oc_')) return false
+  if (String(chatType ?? '') !== 'p2p') return false
+  if (userId === undefined || targetUserId === undefined) return false
+  return String(userId) === String(targetUserId)
+}
+
+/**
  * 形状守卫：过滤掉形态不符的目标（发送前最后一道防线）。
+ * S-12：未知渠道的目标整体拒绝 + warn——拼写错误的渠道键曾因 fail-open 静默放行，
+ * 目标可能被投到根本不是该平台的会话 id 上。
  * @param {string} channel - 渠道键（telegram/feishu/qq/wxpusher/wechat/dingtalk）
  * @param {{ chatId: string, userId?: string }[]} targets - 待发送目标
  * @param {(message: string) => void} [warn] - 跳过时的告警回调（缺省静默）
@@ -46,6 +86,12 @@ export function guardTargets(channel, targets, warn = null) {
   const list = Array.isArray(targets) ? targets : []
   const kept = []
   const skipped = []
+  if (!INBOUND_CHANNEL_SET.has(String(channel ?? ''))) {
+    if (warn !== null) {
+      try { warn(`目标形状守卫拦截（未知渠道 "${channel}"，全部跳过；合法渠道：${INBOUND_CHANNELS.join('/')}）`) } catch { /* 告警失败不致命 */ }
+    }
+    return { kept, skipped: [...list] }
+  }
   for (const target of list) {
     const chatId = String(target?.chatId ?? '')
     if (chatId === '') {

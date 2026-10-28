@@ -15,6 +15,10 @@
 // 存储失败退化为内存态，任何输入形状异常都不抛（上游是对话线与宿主总线，绝不能弄崩宿主）。
 
 import { basename } from 'node:path'
+import { createLog } from '../log.mjs'
+import { createHostEventRegistrar, normalizeAgentLifecyclePayload } from '../host-events.mjs'
+import { normalizeControlOverlay } from '../control/session-arbiter.mjs'
+import { setDurable } from '../inbound/store.mjs'
 
 /** state.json 会话表键（与既有 bind:* / *:account 同域，§2）。 */
 const SESSIONS_KEY = 'route:sessions'
@@ -27,11 +31,40 @@ const DEFAULT_SWEEP_EVERY_MS = 60000
 /** dispose 后定时兜底的上限：ttl 再长也最多 5min 醒一次。 */
 const MAX_SWEEP_DELAY_MS = 300000
 const HOUR_MS = 3_600_000
+/** G-47（W12）：无 disposedAt 的出站覆盖行（route:sessions[id].outbound，/quiet 与管理台
+ * 覆盖配置的落点）的回收 TTL——30d 不活跃即清。registry 建档的覆盖行带 lastActiveAt/createdAt
+ * 可判年龄；agent-router 直写的纯覆盖行无时间戳，由内存首见表兜底（见 sweepAll）。 */
+const OVERLAY_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 /** 解析非负毫秒数选项（0 合法，NaN/负数/缺省回落默认值）。 */
 const nonNegativeMs = (value, fallback) => {
   const n = Number(value)
   return Number.isFinite(n) && n >= 0 ? n : fallback
+}
+
+/** 深拷贝纯 JSON 值（控制覆盖层 copy-on-read：外部读改返回值绝不污染注册表内存态）。 */
+function deepCopyPlain(value) {
+  try { return JSON.parse(JSON.stringify(value ?? null)) } catch { return value }
+}
+
+/** 取「普通对象」：null / 数组 / 标量一律视为无条目（手工编辑或损坏数据防御）。 */
+function plainObjectOf(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  return value
+}
+
+/**
+ * 会话记录的对外**深拷贝**（recordCopy）：顶层浅拷 + 嵌套子键（control/outbound/inbound）深拷。
+ * 外部拿到的副本改 `control.approvalMembers` / `outbound.quiet` / `inbound[0].userId` 等嵌套值
+ * 绝不污染注册表内部 `sessions[id]` 记录（copy-on-read；Stage-4 P2 低风险修复）。
+ */
+function recordCopy(record) {
+  if (record === undefined || record === null) return record
+  const copy = { ...record }
+  if (copy.control !== undefined) copy.control = deepCopyPlain(copy.control)
+  if (copy.outbound !== undefined) copy.outbound = deepCopyPlain(copy.outbound)
+  if (copy.inbound !== undefined) copy.inbound = deepCopyPlain(copy.inbound)
+  return copy
 }
 
 /**
@@ -91,15 +124,15 @@ export function createSessionRegistry(options = {}) {
   const touchWriteMs = nonNegativeMs(options.touchWriteMs, DEFAULT_TOUCH_WRITE_MS)
   const sweepEveryMs = nonNegativeMs(options.sweepEveryMs, DEFAULT_SWEEP_EVERY_MS)
 
-  const warn = (message) => {
-    try { ctx?.logger?.warn?.('[dsh-notifier/session-registry]', message) } catch { /* 日志失败绝不致命 */ }
-  }
+  const log = createLog({ logger: ctx?.logger, tag: '[dsh-notifier-gate/session-registry]' })
+  const warn = (message) => log.warn(message)
+  const info = (message) => log.info(message)
 
   // ---- store 防御壳：任何存储异常都退化为内存态，绝不向上抛 ----
   const loadSessions = () => {
     try {
       const value = store?.get?.(SESSIONS_KEY)
-      if (value !== null && typeof value === 'object' && !Array.isArray(value)) return value
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) return deepCopyPlain(value)
     } catch { /* 损坏/无 store：内存态起步 */ }
     return {}
   }
@@ -107,9 +140,117 @@ export function createSessionRegistry(options = {}) {
   const sessions = loadSessions()
   let lastWriteMs = now() // 构造即视为刚同步过（内存态来自盘上），touch 摊销的基准点
   let lastSweepMs = -Infinity // 首次内联 prune 即真扫一次（清掉停机期间过期的记录）
+  /** 回收删除待落盘的会话 id：写盘失败时保留、下次 persist 再删（对齐 dirty 保留语义）。 */
+  const removedIds = new Set()
+  /** G-47（W12）：无时间戳纯覆盖行（agent-router 直写 route:sessions[id].outbound，无
+   * lastActiveAt/createdAt）的首见时刻——30d 清理的年龄基准。内存态不落盘：重启后重新
+   * 起算，最坏多留一个运行周期（30d 量级，可接受；不引第三方字段污染盘上数据形状）。 */
+  const overlaySeenAt = new Map()
+  /** Fields changed by this registry instance since the last durable write.  Keeping this
+   * per-record/per-field lets router writes to the same route:sessions key converge without
+   * allowing an old cached outbound/control snapshot to overwrite newer store data. */
+  const dirtyFields = new Map()
+  const markDirty = (id, ...fields) => {
+    const key = String(id)
+    let dirty = dirtyFields.get(key)
+    if (dirty === undefined) {
+      dirty = new Set()
+      dirtyFields.set(key, dirty)
+    }
+    for (const field of fields) dirty.add(field)
+  }
+  const markRecordDirty = (id, record) => {
+    markDirty(id, '*')
+    for (const key of Object.keys(record ?? {})) markDirty(id, key)
+  }
+  /** Refresh the in-process cache from the shared store while retaining unsaved local fields. */
+  const refreshSessions = () => {
+    let disk
+    try { disk = plainObjectOf(store?.get?.(SESSIONS_KEY)) } catch { return }
+    if (disk === null) return
+    const ids = new Set([...Object.keys(sessions), ...Object.keys(disk)])
+    for (const id of ids) {
+      if (removedIds.has(id)) {
+        delete sessions[id]
+        continue
+      }
+      const diskRecord = plainObjectOf(disk[id])
+      const dirty = dirtyFields.get(id)
+      if (dirty === undefined || dirty.size === 0) {
+        if (diskRecord === null) delete sessions[id]
+        else sessions[id] = deepCopyPlain(diskRecord)
+        continue
+      }
+      const local = plainObjectOf(sessions[id]) ?? {}
+      const merged = { ...(diskRecord ?? {}) }
+      if (dirty.has('*')) Object.assign(merged, local)
+      else {
+        for (const field of dirty) {
+          if (Object.prototype.hasOwnProperty.call(local, field)) merged[field] = deepCopyPlain(local[field])
+          else delete merged[field]
+        }
+      }
+      sessions[id] = merged
+    }
+  }
+  /**
+   * 把注册表内存态写入 store（route:sessions 一个键）。
+   *
+   * v0.8.7（对抗评审 Stage-4 P1-1）：此前的实现把整个内存 `sessions` 原样覆写，而 agent-router 的
+   * `setSessionControl`/`setSessionOutbound` 直写同一 `route:sessions` 键、admin 也经 router 落盘——
+   * 注册表整表覆写会抹掉 router/admin 刚写入的覆盖层（registry 内存态不包含它们），也可抹掉与
+   * 本次生命周期写无关的跨会话更新。这里改为**记录级再读合并**：
+   *  1. 以盘上当前 `route:sessions` 为基底（store 读收敛 = 含 router/admin 直写的最新值）——未在
+   *     注册表内存态里的盘上记录/覆盖层（如 router 建的 `.control`）原样保留；
+   *  2. 删除回收墓碑（removedIds，由 sweep 落击杀），再把内存态逐记录并入对应盘上记录（浅合并——
+   *     注册表不拥有的子键如 `.control` 因内存态没有该键而得以保留；跨会话无关记录不受影响）；
+   *  3. 每次生命周期写都对 `.control` 子键做归一/丢弃（normalizeControlOverlay，损坏/越界/来源字段
+   *     绝不停留——也是 Stage-4 P2 的「生命周期写前规范化」）；
+   *  4. 仍只写一个 `route:sessions` 键，store 的跨进程锁/键级合并语义完全不变。
+   * 写盘失败（store.set 抛）按既有防御壳降级内存态继续工作，removedIds 保留下次再删。
+   */
   const persist = () => {
-    lastWriteMs = now()
-    try { store?.set?.(SESSIONS_KEY, sessions) } catch { /* 写盘失败：内存态继续工作 */ }
+    try {
+      const base = plainObjectOf(store?.get?.(SESSIONS_KEY)) ?? {}
+      const next = {}
+      for (const [id, value] of Object.entries(base)) next[id] = deepCopyPlain(value)
+      for (const id of removedIds) delete next[id]
+      for (const [id, record] of Object.entries(sessions)) {
+        const dirty = dirtyFields.get(id)
+        if (dirty === undefined || dirty.size === 0) continue
+        const merged = { ...plainObjectOf(base[id]) }
+        if (dirty.has('*')) Object.assign(merged, record)
+        else {
+          for (const field of dirty) {
+            if (Object.prototype.hasOwnProperty.call(record, field)) merged[field] = deepCopyPlain(record[field])
+            else delete merged[field]
+          }
+        }
+        next[id] = merged
+      }
+      // Sanitize every base record, including sessions unknown to this registry cache.
+      for (const [id, value] of Object.entries(next)) {
+        const record = plainObjectOf(value)
+        if (record === null) continue
+        const control = normalizeControlOverlay(record.control)
+        if (control === null) delete record.control
+        else record.control = deepCopyPlain(control)
+        next[id] = record
+      }
+      const writeResult = setDurable(store, SESSIONS_KEY, next)
+      // Stage-4 P1 收官（墓碑持久化收官）：只有持久化真到达盘上才清回收墓碑。
+      // store.set 显式返回 false 是 createStore 的 durable 布尔（v0.8.7 起 save() 传播持久化成功与否，
+      // 写未到达盘）；此时清掉 removedIds 会让「失败的 sweep 写 + 后续生命周期写」把过期会话从盘上
+      // 基底复活——下次 persist 从 store.get 读到未删的盘上旧记录、又没了墓碑可删，过期 id 在盘上
+      // 卷土重来（重启即重现）。故只在 durable 成功（返回非 false）时清；返回 undefined 的既有
+      // store 保持兼容（undefined !== false 仍清）。set 抛错的路径本来就在外层 catch，不复删。
+      if (writeResult === true) {
+        // v0.12.1（P2-13）：写成功后才推进节流窗口；失败必须允许下一次 touch 重试。
+        lastWriteMs = now()
+        removedIds.clear()
+        for (const id of Object.keys(sessions)) dirtyFields.delete(id)
+      }
+    } catch { /* 写盘失败（set 抛）：内存态继续工作，removedIds 留待下次再删 */ }
   }
 
   /** 记录读取（形状异常当不存在，返回 undefined）。 */
@@ -124,29 +265,86 @@ export function createSessionRegistry(options = {}) {
       const nowMs = now()
       record = { inherit: '', workspace: '', createdAt: nowMs, lastActiveAt: nowMs }
       sessions[id] = record
+      markRecordDirty(id, record)
     }
     return record
   }
 
   // ---- 回收（§4：disposed + ttl 到期才删；bind:* 不清——同 id resume 绑定仍有效）----
-  /** 真扫：删除 disposedAt 距 now 超过 ttl 的记录，返回被删的 sessionId 数组。 */
+  // G-47（W12）扩展两条线：
+  //   1. 无 disposedAt 的出站覆盖行（route:sessions[id].outbound）→ 30d 不活跃即清
+  //      （/quiet、管理台覆盖配置长期不回收的单调膨胀封口；宿主活跃的会话覆盖绝不误删）；
+  //   2. 带 outbound 的 disposed 行到期摘除时保留出站覆盖字段——用户的静默配置
+  //      不随会话回收丢失（行瘦身为纯覆盖行，再由 30d 覆盖行 TTL 后续清理）。
+  /** 真扫：删除 disposedAt 距 now 超过 ttl 的记录，返回被回收的 sessionId 数组。 */
   const sweepAll = () => {
+    refreshSessions()
     lastSweepMs = now()
     const nowMs = lastSweepMs
     const removed = []
+    // 宿主活跃判定（agents.list）作覆盖行清理的护栏：live 列表可用时，活跃会话的
+    // outbound 覆盖绝不回收；不可用（null）时退回纯时间判定。
+    const live = liveAgentIds()
     for (const [id, record] of Object.entries(sessions)) {
       const disposedAt = record?.disposedAt
-      if (disposedAt === undefined || disposedAt === null) continue
-      if (nowMs - Number(disposedAt) > ttlMs) removed.push(id)
+      if (disposedAt === undefined || disposedAt === null) {
+        // G-47 线 1：无 disposedAt 的覆盖行 → 30d TTL。registry 建档行以
+        // lastActiveAt/createdAt 判年龄（活跃会话 touch 刷新，30d 内必不触发）；
+        // agent-router 直写的纯覆盖行无时间戳 → 以本实例首见时刻起算（overlaySeenAt）。
+        if (record?.outbound === undefined) continue
+        if (live !== null && live.includes(id)) continue
+        const ageAt = Number(record.lastActiveAt ?? record.createdAt)
+        let stale
+        if (Number.isFinite(ageAt) && ageAt > 0) {
+          stale = nowMs - ageAt > OVERLAY_TTL_MS
+        } else if (overlaySeenAt.has(id)) {
+          stale = nowMs - overlaySeenAt.get(id) > OVERLAY_TTL_MS
+        } else {
+          overlaySeenAt.set(id, nowMs) // 首见登记：自此起算 30d
+          stale = false
+        }
+        if (stale) {
+          // 真正删除：清内存行 + 墓碑（removedIds 让 persist 记录级合并时从盘上基底
+          // 删掉——否则行留在内存、persist 又从盘上基底写回，30d TTL 永不落盘）。
+          delete sessions[id]
+          dirtyFields.delete(id)
+          removedIds.add(id)
+          overlaySeenAt.delete(id)
+          removed.push(id)
+        }
+        continue
+      }
+      if (nowMs - Number(disposedAt) > ttlMs) {
+        if (record?.outbound !== undefined) {
+          // G-47 线 2：会话到期摘除但保留出站覆盖字段。行瘦身为纯覆盖行并以摘除时刻
+          // 作新活跃基准（lastActiveAt=nowMs）——静默配置多活 30d 后由线 1 回收。
+          sessions[id] = { outbound: record.outbound, lastActiveAt: nowMs }
+          dirtyFields.set(id, new Set(['outbound', 'lastActiveAt']))
+          for (const field of ['disposedAt', 'createdAt', 'workspace', 'inherit', 'inbound']) markDirty(id, field)
+          removed.push(id) // 会话已从台账摘除（返回值语义：被回收的会话 id；行本身保留覆盖）
+        } else {
+          delete sessions[id]
+          dirtyFields.delete(id)
+          overlaySeenAt.delete(id)
+          removedIds.add(id) // 回收墓碑：persist 记录级合并时从盘上基底删除（防盘上旧记录被基底复活）
+          removed.push(id)
+        }
+      }
     }
     if (removed.length > 0) {
-      for (const id of removed) delete sessions[id]
+      for (const id of removed) {
+        if (sessions[id] !== undefined) continue // 摘除保留覆盖的行已瘦身，不需二次处理
+        delete sessions[id]
+        dirtyFields.delete(id)
+        removedIds.add(id)
+      }
       persist()
     }
     return removed
   }
   /** 内联摊销回收：挂在常规调用入口，距上次真扫超过 sweepEveryMs 才真扫。 */
   const prune = () => {
+    refreshSessions()
     if (now() - lastSweepMs >= sweepEveryMs) {
       try { sweepAll() } catch (error) { warn(`惰性回收失败: ${error instanceof Error ? error.message : String(error)}`) }
     }
@@ -204,17 +402,26 @@ export function createSessionRegistry(options = {}) {
       if (record === undefined) {
         record = { inherit: workspace, workspace, createdAt: nowMs, lastActiveAt: nowMs }
         sessions[id] = record
+        markRecordDirty(id, record)
         persist()
-        return { ...record }
+        return recordCopy(record)
       }
       record.lastActiveAt = nowMs
-      if (record.disposedAt !== undefined) delete record.disposedAt // 同 id 重建 = resume
+      markDirty(id, 'lastActiveAt')
+      if (record.disposedAt !== undefined) {
+        delete record.disposedAt // 同 id 重建 = resume
+        markDirty(id, 'disposedAt')
+      }
       if ((record.workspace === undefined || record.workspace === '') && workspace !== '') {
         record.workspace = workspace
-        if (record.inherit === undefined || record.inherit === '') record.inherit = workspace
+        markDirty(id, 'workspace')
+        if (record.inherit === undefined || record.inherit === '') {
+          record.inherit = workspace
+          markDirty(id, 'inherit')
+        }
       }
       persist()
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -229,8 +436,9 @@ export function createSessionRegistry(options = {}) {
       if (record === undefined) return undefined
       const nowMs = now()
       record.lastActiveAt = nowMs
+      markDirty(sessionId, 'lastActiveAt')
       if (nowMs - lastWriteMs >= touchWriteMs) persist()
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -246,11 +454,12 @@ export function createSessionRegistry(options = {}) {
       const record = ensureRecord(id)
       if (record.disposedAt === undefined) {
         record.disposedAt = now()
+        markDirty(id, 'disposedAt')
         scheduleSweepTimer(record.disposedAt)
         persist()
       }
       prune()
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -266,9 +475,10 @@ export function createSessionRegistry(options = {}) {
       if (record.disposedAt !== undefined) {
         delete record.disposedAt
         record.lastActiveAt = now()
+        markDirty(sessionId, 'disposedAt', 'lastActiveAt')
         persist()
       }
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -328,7 +538,7 @@ export function createSessionRegistry(options = {}) {
       const activeOf = (id) => (live !== null ? live.includes(id) : recordOf(id)?.disposedAt === undefined)
       return Object.keys(sessions)
         .filter((id) => recordOf(id)?.workspace === target)
-        .map((id) => ({ ...recordOf(id), id, active: activeOf(id) }))
+        .map((id) => ({ ...recordCopy(recordOf(id)), id, active: activeOf(id) }))
         .sort((a, b) => (a.active === b.active ? b.lastActiveAt - a.lastActiveAt : (a.active ? -1 : 1)))
     },
 
@@ -361,7 +571,7 @@ export function createSessionRegistry(options = {}) {
     getSession(sessionId) {
       prune()
       const record = recordOf(sessionId)
-      return record === undefined ? undefined : { ...record }
+      return record === undefined ? undefined : recordCopy(record)
     },
 
     /**
@@ -386,8 +596,85 @@ export function createSessionRegistry(options = {}) {
       }
       if (Object.keys(merged).length > 0) record.outbound = merged
       else delete record.outbound
+      markDirty(id, 'outbound')
       persist()
-      return { ...record }
+      return recordCopy(record)
+    },
+
+    /**
+     * 读会话控制覆盖层（route:sessions[id].control，Stage 4 会话策略持久化的字段级覆盖）。
+     * 返回值是该覆盖层的**规范化深拷贝**：只含 mode/owner/approvalOwnerOnly/approvalMembers 四个
+     * 已批准字段，绝不携带来源字段（channel/accountId/userId/chatId/sessionId），甚至损坏的
+     * control 子键也经 normalizeControlOverlay 清洗后才回读——copy-on-read，外部改返回值不污染内部。
+     * @param {string} sessionId
+     * @returns {object|undefined} 规范覆盖层深拷贝；记录不存在或覆盖层为空/损坏时 undefined
+     */
+    getControl(sessionId) {
+      prune()
+      const record = recordOf(String(sessionId ?? ''))
+      if (record === undefined) return undefined
+      const normalized = normalizeControlOverlay(record.control)
+      return normalized === null ? undefined : deepCopyPlain(normalized)
+    },
+
+    /**
+     * Read a session outbound overlay as a defensive deep copy.  The shared store is
+     * refreshed on every read so router/admin writes made after registry construction
+     * become visible without requiring a restart.
+     * @param {string} sessionId
+     * @returns {object|undefined} outbound diff copy
+     */
+    getOutbound(sessionId) {
+      prune()
+      const record = recordOf(String(sessionId ?? ''))
+      const outbound = plainObjectOf(record?.outbound)
+      return outbound === null ? undefined : deepCopyPlain(outbound)
+    },
+
+    /**
+     * 写会话控制覆盖层（diff 字段级合并，非快照——与 setOutbound 同语义）：
+     * diff 中**出现**且值为 null/undefined 的字段从覆盖层删除（回落 basePolicy）；出现且非空的写入
+     * （写入前一律经 normalizeControlOverlay 清洗，越界/通配/来源字段静默丢弃，绝不投毒）；
+     * 未出现的字段不动。记录不存在时惰性建最小记录。写前先合并到现有覆盖层再整体归一再落盘，
+     * 保证即便是直接内存直写或损坏输入也不会让无效字段进店。写盘失败按既有 store 防御壳降级
+     * （内存态继续工作，绝不向上抛）。
+     * @param {string} sessionId
+     * @param {object} diff - { mode?, owner?, approvalOwnerOnly?, approvalMembers? }；null 值 = 删键
+     * @returns {object|undefined} 写后记录副本（含新覆盖层）；sessionId 空时 undefined
+     */
+    setControl(sessionId, diff) {
+      refreshSessions()
+      const id = String(sessionId ?? '')
+      if (id === '') return undefined
+      const record = ensureRecord(id)
+      const existing = normalizeControlOverlay(record.control)
+      const merged = existing === null ? {} : deepCopyPlain(existing)
+      const input = diff !== null && typeof diff === 'object' ? diff : {}
+      for (const key of ['mode', 'owner', 'approvalOwnerOnly', 'approvalMembers']) {
+        if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+        const value = input[key]
+        if (value === undefined || value === null) delete merged[key]
+        else merged[key] = value
+      }
+      const normalized = normalizeControlOverlay(merged)
+      if (normalized === null) delete record.control
+      else record.control = deepCopyPlain(normalized)
+      markDirty(id, 'control')
+      persist()
+      return recordCopy(record)
+    },
+
+    /** 清空会话控制覆盖层（幂等；记录/覆盖层不存在时安全无操作）。 */
+    clearControl(sessionId) {
+      refreshSessions()
+      const record = recordOf(String(sessionId ?? ''))
+      if (record === undefined) return undefined
+      if (record.control !== undefined) {
+        delete record.control
+        markDirty(sessionId, 'control')
+        persist()
+      }
+      return recordCopy(record)
     },
 
     /**
@@ -405,15 +692,16 @@ export function createSessionRegistry(options = {}) {
       const userId = binding?.userId
       if (channel === undefined || channel === null || userId === undefined || userId === null) {
         const existing = recordOf(id)
-        return existing === undefined ? undefined : { ...existing }
+        return existing === undefined ? undefined : recordCopy(existing)
       }
       const record = ensureRecord(id)
       const list = Array.isArray(record.inbound) ? record.inbound.filter((item) => item != null) : []
       if (!list.some((item) => item.channel === channel && item.userId === userId)) {
         record.inbound = [...list, { channel, userId }]
+        markDirty(id, 'inbound')
         persist()
       }
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -433,9 +721,10 @@ export function createSessionRegistry(options = {}) {
       if (next.length !== list.length) {
         if (next.length === 0) delete record.inbound
         else record.inbound = next
+        markDirty(sessionId, 'inbound')
         persist()
       }
-      return { ...record }
+      return recordCopy(record)
     },
 
     /**
@@ -455,6 +744,7 @@ export function createSessionRegistry(options = {}) {
         if (typeof value !== 'string' || value === '') continue
         if (recordOf(value) !== undefined) continue
         sessions[value] = { inherit: '', workspace: '', createdAt: nowMs, lastActiveAt: nowMs }
+        markRecordDirty(value, sessions[value])
         migrated += 1
       }
       if (migrated > 0) persist()
@@ -463,9 +753,12 @@ export function createSessionRegistry(options = {}) {
 
     /** 反注册宿主事件 + 清理全部定时兜底（幂等，可重复调用）。 */
     dispose() {
+      // v0.12.1（P2-12）：退出前先把节流窗口内的最后一批会话状态落盘。
+      try { persist() } catch { /* 退出路径不抛 */ }
       for (const disposer of disposers.splice(0)) {
         try { disposer() } catch { /* 反注册失败不致命 */ }
       }
+      hostEvents.reportZeroEvents()
       for (const timer of sweepTimers) clearTimeout(timer)
       sweepTimers.clear()
     },
@@ -473,13 +766,16 @@ export function createSessionRegistry(options = {}) {
 
   // ---- 宿主事件接线（全防御：注册失败降级为惰性建档模式，绝不抛，§4）----
   const disposers = []
+  const hostEvents = createHostEventRegistrar(ctx, warn, Date.now, info)
   const listen = (event, handler) => {
-    let disposer = null
-    try {
-      disposer = ctx?.on?.(event, (payload) => {
-        try { handler(payload) } catch (error) { warn(`${event} 处理失败: ${error instanceof Error ? error.message : String(error)}`) }
-      })
-    } catch { /* 宿主无此事件：降级为惰性建档模式 */ }
+    const disposer = hostEvents.on(event, (payload) => {
+      const agent = normalizeAgentLifecyclePayload(payload)
+      if (agent === undefined) {
+        warn(`${event} 载荷已拒绝（仅接受 { agent } 或直接 agent）`)
+        return
+      }
+      try { handler(agent) } catch (error) { warn(`${event} 处理失败: ${error instanceof Error ? error.message : String(error)}`) }
+    })
     if (typeof disposer === 'function') disposers.push(disposer)
   }
   listen('agent/created', (agent) => { registry.ensureSession(agent) })

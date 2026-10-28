@@ -5,6 +5,7 @@
 import { ADAPTERS, normalizeMessage, channelResult } from './config.mjs'
 import { resolveRouting, routeTargets, retryPolicyOf, sendWithRetry, normalizeLevel } from './routing.mjs'
 import { sendSegmented } from './inbound/segment.mjs'
+import { isConfirmedReceipt } from './delivery-evidence.mjs'
 
 /**
  * 创建一个 notifier：内部持有「已启用渠道」列表。
@@ -14,7 +15,7 @@ import { sendSegmented } from './inbound/segment.mjs'
  * @param {object} [options.routing] - routing 配置原值（resolveRouting 解析）；未配置时广播全部渠道（基线行为）。
  * @param {object} [options.retry] - 重试覆盖（{ enabled?, attempts?, backoffMs? }）；仅配置 routing 后生效。
  * @param {object} [options.segment] - 出站分段（{ enabled?, maxCodepoints? }）；默认开、1200 码点。
- * @param {(record: object) => void} [options.onSend] - 每次广播结束的回调（通知账本用，阶段 6）。
+ * @param {(record: object) => void} [options.onSend] - 每次发送结束的回调（通知账本/事件用）。
  * @returns { notify, notifyAll, flush, channelCount }
  */
 export function createNotifier(ctx, channels, options = {}) {
@@ -23,29 +24,52 @@ export function createNotifier(ctx, channels, options = {}) {
     try { logger?.warn?.('[dsh-notifier]', ...args) } catch { /* 日志失败绝不致命 */ }
   }
   const routing = options.routing !== undefined ? resolveRouting(options.routing) : resolveRouting()
+  const channelsNow = () => {
+    if (channels !== null && typeof channels === 'object' && typeof channels.snapshot === 'function') {
+      try {
+        const value = channels.snapshot()
+        return Array.isArray(value) ? value : []
+      } catch { return [] }
+    }
+    return Array.isArray(channels) ? channels : []
+  }
   const segment = (options.segment !== null && typeof options.segment === 'object')
     ? options.segment
     : { enabled: true, maxCodepoints: 1200 }
 
+  const audit = (message, outcome, extra = {}) => {
+    if (typeof options.onSend !== 'function') return
+    const record = { time: extra.time ?? new Date().toISOString(), message, ...outcome }
+    if (extra.source !== null && typeof extra.source === 'object') record.source = extra.source
+    if (typeof extra.channel === 'string' && extra.channel !== '') record.channel = extra.channel
+    try { options.onSend(record) } catch { /* audit failure never affects delivery */ }
+  }
+
   /** 包装单渠道发送：分段开启且超预算时切段顺序送达，任一段失败即整体失败。 */
-  const sendOne = (type, config, msg) => {
+  const sendOne = async (type, config, msg) => {
     const adapter = ADAPTERS[type]
     if (segment.enabled === false) return adapter.send(config, msg)
-    return sendSegmented((piece) => adapter.send(config, piece), msg, { maxCodepoints: segment.maxCodepoints })
-      .then(({ sent, total, error }) => {
-        if (error === null) return undefined
-        if (sent > 0) {
-          // v0.6.3：部分送达标记 noRetry——重试单元若仍是「整条消息」，已送达的
-          // 前 N 段会被重发（timeSensitive 3 次尝试 = 同通知收到多份前半段轰炸）。
-          // 重试层见 routing.sendWithRetry 对 noRetry 的短路。
-          const partial = new Error(`分段送达中断：${sent}/${total} 段成功`)
-          partial.cause = error
-          partial.noRetry = true
-          throw partial
-        }
-        throw error
-      })
+    let last
+    const outcome = await sendSegmented(async (piece) => {
+      last = await adapter.send(config, piece)
+      return last
+    }, msg, { maxCodepoints: segment.maxCodepoints })
+    if (outcome.error === null) return last
+    if (outcome.sent > 0) {
+      // v0.6.3：部分送达标记 noRetry——重试单元若仍是「整条消息」，已送达的
+      // 前 N 段会被重发（timeSensitive 3 次尝试 = 同通知收到多份前半段轰炸）。
+      // 重试层见 routing.sendWithRetry 对 noRetry 的短路。
+      const partial = new Error(`分段送达中断：${outcome.sent}/${outcome.total} 段成功`)
+      partial.cause = outcome.error
+      partial.noRetry = true
+      throw partial
+    }
+    throw outcome.error
   }
+
+  // v0.13（C11.5 / R4）：只有适配器返回显式回执才算「确认送达」；其余成功一律只是
+  // 「provider accepted」（请求已被提供方接受，无端到端送达证据）。词汇权威见 delivery-evidence.mjs。
+  const confirmedOf = isConfirmedReceipt
 
   // 在途推送账本：flush 时等待它们完成（headless 一次性运行退出前也能送达）。
   const inFlight = new Set()
@@ -61,22 +85,40 @@ export function createNotifier(ctx, channels, options = {}) {
   }
 
   /** 单渠道推送：未配置/未知渠道静默跳过 + warn 提示；已配置渠道失败返回 failed 结果（不抛出，供工具渲染中文反馈）。 */
-  async function notify(channel, msg) {
+  async function notify(channel, msg, sendOptions = {}) {
     const type = typeof channel === 'string' ? channel.trim() : ''
     const normalized = normalizeMessage(msg)
-    const entry = channels.find((item) => item.type === type)
+    const entry = channelsNow().find((item) => item.type === type)
     if (entry === undefined) {
       warn(`渠道 "${type || '(空)'}" 未配置，已跳过推送（可用类型：${Object.keys(ADAPTERS).join('/')}）`)
-      return channelResult(type || '(空)', 'skipped')
+      const result = channelResult(type || '(空)', 'skipped')
+      audit(normalized, { ok: false, accepted: [], confirmed: [], delivered: [], skipped: [`(${result.channel})`], failed: [] }, { source: sendOptions?.source, channel: result.channel })
+      return result
     }
     return track((async () => {
       try {
-        await sendOne(type, entry.config, normalized)
-        return channelResult(type, 'sent')
+        const sent = await sendOne(type, entry.config, normalized)
+        const confirmed = confirmedOf(sent)
+        const result = channelResult(type, 'sent')
+        // delivered 是 legacy 别名（== accepted）；accepted/confirmed 才是有证据强度的语义。
+        audit(normalized, {
+          ok: true,
+          accepted: [type],
+          confirmed: confirmed ? [type] : [],
+          delivered: [type],
+          skipped: [],
+          failed: [],
+        }, { source: sendOptions?.source, channel: type })
+        return result
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error)
-        warn(`渠道 "${type}" 推送失败: ${reason}`)
-        return channelResult(type, 'failed', error)
+        // G-53 分层：failed[].error / audit 记公开文案（无响应体/网络原文）；
+        // 完整 detail 只进 warn 日志（宿主 logger + 排障可见，不进事件/工具反馈）。
+        const publicText = error instanceof Error ? (error.publicMessage ?? error.message) : String(error)
+        const internalDetail = error instanceof Error ? (error.detail ?? error.message) : String(error)
+        warn(`渠道 "${type}" 推送失败: ${internalDetail}`)
+        const result = channelResult(type, 'failed', error)
+        audit(normalized, { ok: false, accepted: [], confirmed: [], delivered: [], skipped: [], failed: [{ channel: type, error: publicText }] }, { source: sendOptions?.source, channel: type })
+        return result
       }
     })())
   }
@@ -100,17 +142,16 @@ export function createNotifier(ctx, channels, options = {}) {
     const sourceExtra = (source !== null && typeof source === 'object') ? { source } : {}
     if (quiet) {
       // 静音不等于没发生：账本照记（delivered 空、skipped 标记），方便晨报反映被静音的流量
-      const quietOutcome = { ok: true, delivered: [], skipped: ['(quiet)'], failed: [] }
-      if (typeof options.onSend === 'function') {
-        try { options.onSend({ time: new Date().toISOString(), message: normalized, ...quietOutcome, ...sourceExtra }) } catch { /* 账本失败绝不影响 */ }
-      }
+      const quietOutcome = { ok: true, accepted: [], confirmed: [], delivered: [], skipped: ['(quiet)'], failed: [] }
+      audit(normalized, quietOutcome, { source: sourceExtra.source })
       return quietOutcome
     }
-    if (channels.length === 0) {
+    const currentChannels = channelsNow()
+    if (currentChannels.length === 0) {
       warn('未配置任何已启用渠道，notifyAll 无操作')
-      return { ok: false, delivered: [], skipped: [], failed: [] }
+      return { ok: false, accepted: [], confirmed: [], delivered: [], skipped: [], failed: [] }
     }
-    const targets = routeTargets(routing, channels, normalized)
+    const targets = routeTargets(routing, currentChannels, normalized)
       .filter((target) => filterTypes === null || filterTypes.includes(target.type))
     // v0.6.3 空目标可见化（审查 R1 P1-2）：路由矩阵/分流过滤后目标为空时，原实现
     // delivered/failed/skipped 三空 + ok:true + 零日志——agent 绑定的渠道后来被禁用/
@@ -120,14 +161,13 @@ export function createNotifier(ctx, channels, options = {}) {
       const hint = filterTypes !== null
         ? `分流过滤（channelTypes: [${filterTypes.join(', ')}]）后无目标`
         : '路由矩阵（routing 配置）未命中任何已启用渠道'
-      warn(`notifyAll 目标为空：${hint}（可用渠道：${channels.map((entry) => entry.type).join('/') || '无'}）`)
-      const emptyOutcome = { ok: true, delivered: [], skipped: ['(no-targets)'], failed: [] }
-      if (typeof options.onSend === 'function') {
-        try { options.onSend({ time: new Date().toISOString(), message: normalized, ...emptyOutcome, ...sourceExtra }) } catch { /* 账本失败绝不影响推送 */ }
-      }
+      warn(`notifyAll 目标为空：${hint}（可用渠道：${currentChannels.map((entry) => entry.type).join('/') || '无'}）`)
+      const emptyOutcome = { ok: true, accepted: [], confirmed: [], delivered: [], skipped: ['(no-targets)'], failed: [] }
+      audit(normalized, emptyOutcome, { source: sourceExtra.source })
       return emptyOutcome
     }
-    const delivered = []
+    const accepted = []
+    const confirmed = []
     const failed = []
     const skipped = []
     const retry = routing.configured
@@ -135,27 +175,32 @@ export function createNotifier(ctx, channels, options = {}) {
       : { attempts: 1, backoffMs: 0 }
     const batch = targets.map(async (target) => {
       try {
-        await sendWithRetry(
+        const sent = await sendWithRetry(
           () => sendOne(target.type, target.entry.config, target.message),
           { ...retry, onRetry: (attempt, error) => warn(`渠道 "${target.type}" 第 ${attempt} 次失败，准备重试: ${error instanceof Error ? error.message : String(error)}`) },
         )
-        delivered.push(target.type)
+        accepted.push(target.type)
+        if (confirmedOf(sent)) confirmed.push(target.type)
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error)
-        warn(`渠道 "${target.type}" 推送失败: ${reason}`)
-        failed.push({ channel: target.type, error: reason })
+        // G-53：同 notify()——公开文案进 failed[]，内部细节只进日志。
+        const publicText = error instanceof Error ? (error.publicMessage ?? error.message) : String(error)
+        const internalDetail = error instanceof Error ? (error.detail ?? error.message) : String(error)
+        warn(`渠道 "${target.type}" 推送失败: ${internalDetail}`)
+        failed.push({ channel: target.type, error: publicText })
       }
     })
     await track(Promise.all(batch))
     const outcome = {
       ok: failed.length === 0,
-      delivered,
+      // v0.13（C11.5 / R4）：accepted = provider 已接受请求；confirmed = 有显式回执。
+      // delivered 保留为 legacy 别名（== accepted），消费方不得据此宣称「已确认送达」。
+      accepted,
+      confirmed,
+      delivered: accepted,
       skipped,
       failed,
     }
-    if (typeof options.onSend === 'function') {
-      try { options.onSend({ time: new Date().toISOString(), message: normalized, ...outcome, ...sourceExtra }) } catch { /* 账本失败绝不影响推送 */ }
-    }
+    audit(normalized, outcome, { source: sourceExtra.source })
     return outcome
   }
 
@@ -163,7 +208,7 @@ export function createNotifier(ctx, channels, options = {}) {
     notify,
     notifyAll,
     flush,
-    channelCount: channels.length,
-    channels: channels.map((entry) => entry.type),
+    get channelCount() { return channelsNow().length },
+    get channels() { return channelsNow().map((entry) => entry.type) },
   }
 }

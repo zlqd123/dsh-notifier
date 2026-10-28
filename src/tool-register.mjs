@@ -3,7 +3,7 @@
 // compileParameters DSL 模式照搬 dsh-dingtalk：作者 DSL -> 原生 JSON Schema（wire 请求逐字携带）。
 
 import { CHANNEL_TYPES } from './config.mjs'
-import { TEST_MESSAGE } from './health.mjs'
+import { stringsOf } from './strings.mjs'
 import { workspaceOf } from './routing/session-registry.mjs'
 
 /**
@@ -32,6 +32,32 @@ export function createRateLimiter({ limitPerMinute = 10, now = Date.now } = {}) 
       return limit
     },
   }
+}
+
+/**
+ * 工具返回值里「可缺省的字符串」归一：undefined / null / 非字符串一律给空串。
+ *
+ * 为什么必须有这一步：宿主对工具返回值做 lossless JSON 校验，对象里只要存在一个
+ * 值为 undefined 的键就整条调用失败（ToolOutputError: INVALID_TOOL_OUTPUT）。而
+ * 工具入参里可省略的字段（如 channel）在未传时就是 undefined——原样回填进返回值
+ * 会把「渠道未配置」变成一个看起来像插件崩溃的错误。返回空串既保留语义
+ * （空 = 未指定），又不破坏 JSON 契约。
+ */
+function stringOf(value) {
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * 失败文案归一：Error → message，字符串原样，其余给可读兜底。
+ * 绝不返回 undefined（宿主 lossless JSON 校验会因此让整条工具调用失败），
+ * 也绝不返回字符串 "undefined"（那是把 JS 内部状态泄露给用户）。
+ */
+function errorTextOf(error) {
+  if (error === null || error === undefined) return '未知错误'
+  if (typeof error === 'string') return error === '' ? '未知错误' : error
+  if (error instanceof Error) return error.message === '' ? '未知错误' : error.message
+  const text = String(error)
+  return text === '' || text === 'undefined' || text === 'null' ? '未知错误' : text
 }
 
 /** 把作者 DSL 编译成原生 JSON Schema（defineTool 的 parameters 必须如此）。 */
@@ -127,7 +153,11 @@ export function registerNotifyTool(ctx, notifier, options = {}) {
       }
       const message = { title: typeof args.title === 'string' ? args.title : '', content: args.message }
       if (notifier.channelCount === 0) {
-        return { ok: false, skipped: true, channel: args.channel, delivered: [], failed: [] }
+        // 注意：绝不能把 args.channel 原样放进返回值——未传时它是 undefined，
+        // 而宿主对工具返回值做「lossless JSON」校验：对象里存在值为 undefined 的键
+        // 即判非法（ToolOutputError: INVALID_TOOL_OUTPUT），整个工具调用直接失败，
+        // 用户看到的是「工具坏了」而不是「渠道没配」。真机 2026-10-24 踩过。
+        return { ok: false, skipped: true, channel: stringOf(args.channel), delivered: [], failed: [] }
       }
       if (typeof args.channel === 'string' && args.channel.trim() !== '') {
         // 单渠道路径不分流：agent 已显式点名渠道，路由过滤只会添乱（v0.3.1 行为原样保留）
@@ -138,7 +168,7 @@ export function registerNotifyTool(ctx, notifier, options = {}) {
         if (result.ok) {
           return { ok: true, channel: result.channel, delivered: [result.channel], failed: [] }
         }
-        return { ok: false, channel: result.channel, delivered: [], failed: [{ channel: result.channel, error: result.error?.message ?? String(result.error) }] }
+        return { ok: false, channel: result.channel, delivered: [], failed: [{ channel: result.channel, error: errorTextOf(result.error) }] }
       }
       // v0.3.2 广播分流（设计稿 §8-5）：工具执行上下文能取到 agentId 且注入了 router 时，
       // 广播按该 agent 的绑定通道集合过滤。agentId 三级防御兜底——宿主工具调用上下文
@@ -169,7 +199,10 @@ export function registerNotifyTool(ctx, notifier, options = {}) {
       return {
         ok: broadcast.failed.length === 0,
         delivered: broadcast.delivered,
-        failed: broadcast.failed.map((item) => ({ channel: item.channel, error: item.error })),
+        failed: broadcast.failed.map((item) => ({
+          channel: stringOf(item.channel),
+          error: errorTextOf(item.error),
+        })),
       }
     },
   })
@@ -205,9 +238,14 @@ export function registerNotifyTestTool(ctx, notifier, options = {}) {
         return { ok: false, rateLimited: true, rateLimit: limiter.limit, delivered: [], failed: [] }
       }
       if (notifier.channelCount === 0) {
-        return { ok: false, skipped: true, channel: args.channel, delivered: [], failed: [] }
+        // 注意：绝不能把 args.channel 原样放进返回值——未传时它是 undefined，
+        // 而宿主对工具返回值做「lossless JSON」校验：对象里存在值为 undefined 的键
+        // 即判非法（ToolOutputError: INVALID_TOOL_OUTPUT），整个工具调用直接失败，
+        // 用户看到的是「工具坏了」而不是「渠道没配」。真机 2026-10-24 踩过。
+        return { ok: false, skipped: true, channel: stringOf(args.channel), delivered: [], failed: [] }
       }
-      const message = { title: 'dsh-notifier 自检', content: TEST_MESSAGE, level: 'active' }
+      const health = options.strings?.health ?? stringsOf().health
+      const message = { title: health.title, content: health.testMessage, level: 'active' }
       if (typeof args.channel === 'string' && args.channel.trim() !== '') {
         const result = await notifier.notify(args.channel.trim(), message)
         if (result.skipped === true) {
@@ -216,13 +254,16 @@ export function registerNotifyTestTool(ctx, notifier, options = {}) {
         if (result.ok) {
           return { ok: true, channel: result.channel, delivered: [result.channel], failed: [] }
         }
-        return { ok: false, channel: result.channel, delivered: [], failed: [{ channel: result.channel, error: result.error?.message ?? String(result.error) }] }
+        return { ok: false, channel: result.channel, delivered: [], failed: [{ channel: result.channel, error: errorTextOf(result.error) }] }
       }
       const broadcast = await notifier.notifyAll(message)
       return {
         ok: broadcast.failed.length === 0,
         delivered: broadcast.delivered,
-        failed: broadcast.failed.map((item) => ({ channel: item.channel, error: item.error })),
+        failed: broadcast.failed.map((item) => ({
+          channel: stringOf(item.channel),
+          error: errorTextOf(item.error),
+        })),
       }
     },
   })
