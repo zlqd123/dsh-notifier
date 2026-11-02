@@ -492,6 +492,21 @@ export function createQuestionBridge(deps, strings) {
   }
 
   /** 可信裁决（编号回复：白名单已由 bus.accept 建立，跳 token，仍受首达采纳约束）。 */
+  /**
+   * 把 Control Core 的裁决原因并进反馈文案。
+   *
+   * 之前只用 verdict.message，而收据里的 reason（例如 source_mismatch_channel、
+   * rejected、duplicate_event）被丢弃了——用户看到「已作答/已过期」这种笼统说法，
+   * 实际点击没生效，主观上就是「我选了却说超时」。
+   * 现在把原因附在末尾，一眼能看出是没过授权、来源不匹配还是真的过期。
+   */
+  function receiptFeedback(receipt, fallback) {
+    const base = (receipt && typeof receipt.message === 'string' && receipt.message !== '') ? receipt.message : fallback
+    const reason = receipt && typeof receipt.reason === 'string' ? receipt.reason : ''
+    if (reason === '') return base
+    return `${base}（${reason}）`
+  }
+
   function decideTrusted({ qKey, optIdxes, via = 'unknown', userId = '(unknown)' }) {
     const row = ledger.get(qKey)
     if (row === undefined || row.status !== 'pending') {
@@ -559,7 +574,7 @@ export function createQuestionBridge(deps, strings) {
         feedback(t.skippedFeedback)
       } else {
         // 已决/组聊/来源不满足 → fail-closed：消费回调、提示不可再跳，绝不放行词条
-        feedback(verdict.message ?? t.alreadyAnsweredFirstWin)
+        feedback(receiptFeedback(verdict, t.alreadyAnsweredFirstWin))
       }
       return true
     }
@@ -574,7 +589,7 @@ export function createQuestionBridge(deps, strings) {
       return true
     }
     const verdict = deps.control.handle({ eventId: String(envelope.messageId ?? ''), command: 'question-answer', qKey, optIdx, token: String(action.token ?? ''), via: `${envelope.channel}:button`, channel: envelope.channel, accountId: envelope.accountId, userId: envelope.userId, chatId: envelope.chatId, chatType: envelope.chatType })
-    feedback(verdict.message ?? t.answeredOrExpired)
+    feedback(receiptFeedback(verdict, t.answeredOrExpired))
     return true
   }
 
@@ -873,7 +888,7 @@ export function createQuestionBridge(deps, strings) {
       if (inbound !== undefined) void inbound.sendText(envelope.chatId, t.answeredCustom(answer)).catch(() => {})
     } else {
       // 已决/来源不满足 → fail-closed：消费消息、提示不可再答
-      if (inbound !== undefined) void inbound.sendText(envelope.chatId, verdict.message ?? t.alreadyAnsweredFirstWin).catch(() => {})
+      if (inbound !== undefined) void inbound.sendText(envelope.chatId, receiptFeedback(verdict, t.alreadyAnsweredFirstWin)).catch(() => {})
     }
     return true
   }
@@ -1004,7 +1019,7 @@ export function createQuestionBridge(deps, strings) {
       return true
     }
     // 罕见竞态（作答瞬间恰好超时）：回执说明，同样消费避免把裸编号漏进对话路由
-    sendFeedback(verdict.message ?? t.answeredOrExpired)
+    sendFeedback(receiptFeedback(verdict, t.answeredOrExpired))
     return true
   }
 

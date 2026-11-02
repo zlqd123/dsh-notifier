@@ -836,16 +836,33 @@ export function createQqInbound(options = {}) {
       try {
         const isUserTarget = targetKindOf(chatId) === 'user'
         if (!isUserTarget) return null // 群聊不展示可操作提问卡，避免成员间信息/权限泄漏
-        // 按钮 label 只有 15 码点：**不再加「1. 」序号前缀**，把额度全部留给选项正文。
-        // 编号由卡片正文的 `**1.**` 清单承担（正文无长度限制），按钮与正文靠顺序对应；
-        // 点击回调仍按 optIdx 精确结算，不依赖按钮上的序号。
-        const buttons = options.slice(0, 5).map((label, index) => ({
+        // 按钮标签只放编号「1」「2」…：正文已经用 `**1.** 选项内容` 列了清单，
+        // 按钮再塞一遍长文本既挤（15 码点上限）又要和正文两处对读。
+        // 编号即下标 +1，点击回调仍按 optIdx 精确结算。
+        //
+        // 布局：每个选项一个按钮，**两个一行（两排两列）**——一列一个大按钮在手机上
+        // 会把卡片拉得很长，两列更好点也更好看。奇数个时最后一个独占一行。
+        const optionButtons = options.map((label, index) => ({
           id: `q_${index}`,
-          render_data: { label: clampButtonLabel(String(label)), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+          render_data: {
+            label: clampButtonLabel(String(index + 1)),
+            visited_label: clampButtonLabel(String(index + 1)),
+            style: 0,
+          },
           action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, String(index), token) },
         }))
-        buttons.push({ id: 'q_custom', render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 }, action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) } })
-        const messageId = await postMarkdownWithKeyboard(chatId, `${title}\n${content}`, { content: { rows: buttons.map((button) => ({ buttons: [button] })) } })
+        const rows = []
+        for (let i = 0; i < optionButtons.length; i += 2) rows.push({ buttons: optionButtons.slice(i, i + 2) })
+        // 「自定义回答」单独一行、占满整行：它不是选项之一，混进编号格里容易误点。
+        rows.push({
+          buttons: [{
+            id: 'q_custom',
+            render_data: { label: clampButtonLabel(t.customAnswerLabel), visited_label: clampButtonLabel(t.selectedVisited), style: 0 },
+            action: { type: 1, permission: { type: 2 }, click_limit: 1, data: buildQuestionAction(qKey, 'c', token) },
+          }],
+        })
+        const messageId = await postMarkdownWithKeyboard(chatId, `${title}
+${content}`, { content: { rows } })
         return messageId === null ? null : { messageId }
       } catch (error) {
         warn(`提问卡片发送失败，降级编号: ${error instanceof Error ? error.message : String(error)}`)

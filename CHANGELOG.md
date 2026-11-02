@@ -3,6 +3,44 @@
 本副本基于 `dsh-notifier` 0.13.1（MIT）裁剪。上游完整变更史见
 <https://github.com/THEWOLFWALKER/dsh-notifier/blob/main/CHANGELOG.md>。
 
+## [0.13.1-qq.12]
+
+修复「Web 计划审批点击后窗口消失、没生效」。
+
+### 根因（真机复盘，2026-11-02 10:53 计划审批）
+
+`native-questions.mjs` 的空答案兜底定时器（5 分钟）与插件内部提问超时（5 分钟）
+**等长且同时触发**：超时空答案被 race 判为赢家交还宿主，宿主（plan-mode）据此判定
+"keep planning" 并结束 `exit_plan_mode` 调用——而此刻 **Web 卡片还活着**。
+用户随后点击 Approve 落在孤儿卡上：宿主 `ask()` 早已结算，点击只让卡片消失，
+答案无人消费。账本实锤：`aq:1f4e17da` 行 `decision=timeout`、`via=null`——
+Web 点击从未到达任何结算链路。
+
+### 修复（`src/host/native-questions.mjs` race 语义重构）
+
+- **「未作答不算作答」升级为「下游死亡驱动」**：Web 链路存活期间，手机侧超时空答案
+  永不注入宿主；宿主保持等待 GUI 点击（plan-mode 的 `ask()` 本就无超时，语义正确）。
+- **下游死亡信号**（`downstreamDied$`）：GUI answerer 真正 reject（headless
+  NO_PROVIDER、GUI 异常、请求取消）时才放行手机侧结果（真答案或超时空答案）闭环宿主。
+- **5 分钟「替用户决定」定时器 → 30 分钟防泄漏硬顶**：到点仅退出 race 等待
+  `mobileAnswerRaw`（必然 settle），不再主动制造空答案抢在 GUI 前面。
+- 分支修复：died/lease 分支改等 `mobileAnswerRaw`（必然 settle）；旧写法等的是
+  已被转换成「永不 settle」的 promise，会挂死宿主。
+
+### 验证（真桥集成测试，6 场景全过）
+
+| 场景 | 赢家 |
+|---|---|
+| Web 先答 | Web ✔ |
+| Web 悬置 + 手机已答 | 手机 ✔ |
+| Web 悬置 + 手机超时 | 租约后空答案（不挂死）✔ |
+| Web 拒绝(NO_PROVIDER) + 手机超时 | 空答案闭环 ✔ |
+| Web 拒绝 + 手机已答 | 手机 ✔ |
+| **事故形态：手机先超时 + Web 存活** | **Web 点击生效** ✔（修复前：空答案抢先，Web 点击落孤儿卡） |
+
+测试桩接线注意：GUI 行为须经 handler 的 `next()` 注入（waterfall 下一环），
+`ctx.waterfall` 不在这条链上。
+
 ## [0.13.1-qq.11]
 
 按钮 label 上限 10 → **15 码点**（实测值）。

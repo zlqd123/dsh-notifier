@@ -165,6 +165,12 @@ export function createNativeQuestionBridge(deps = {}) {
    * next() 至多调用一次（nextCalled 哨兵）；拦截器任何异常透传下游或返回空答案，
    * 绝不让宿主提问被静默吞掉。
    */
+  /** 造一份「全部未选」的答案批次（宿主据此按自身语义解释为未作答）。 */
+  const EMPTY_ANSWERS = (request) => ({
+    answers: (Array.isArray(request?.questions) ? request.questions : [])
+      .map((question) => ({ id: String(question?.id ?? ''), selected: [] })),
+  })
+
   function waterfallHandler(request, next) {
     let nextCalled = false
     const downstreamOnce = () => {
@@ -176,37 +182,40 @@ export function createNativeQuestionBridge(deps = {}) {
       if (questions.length === 0 || canDeliver() !== true) return downstreamOnce()
       // 拦截器范围取消信号：GUI 先答时 abort（收尾语义全部在 askQuestions 侧落地）。
       const controller = new AbortController()
-      // hostAsk 全捕获（内部 catch → 空答案），此处再兜一层防御：绝不让 race 因本侧 reject。
-      const telegramAnswer = Promise.resolve().then(() => hostAsk(request, { signal: controller.signal }))
-        .catch(() => ({ answers: (Array.isArray(request?.questions) ? request.questions : [])
-          .map((question) => ({ id: String(question?.id ?? ''), selected: [] })) }))
-        // 关键：本侧「没答出来」（超时/未作答/异常 → 全空 selected 且无 custom）时
-        // **不得**抢走 race。旧实现把它当赢家返回给宿主，宿主据此认为"用户没选"，
-        // 而此刻 Web 卡片还在等人作答 —— 表现就是「多端同步没了，只剩 QQ」。
-        // 这里把「空答案」转成永不 settle：让下游（GUI answerer）继续跑完。
-        .then((result) => {
-          const answered = Array.isArray(result?.answers)
-            && result.answers.some((entry) => (Array.isArray(entry?.selected) && entry.selected.length > 0)
-              || (typeof entry?.custom === 'string' && entry.custom !== ''))
-          return answered ? result : new Promise(() => { /* 未作答：悬置，交给下游 */ })
-        })
+      // 本侧原始结果（hostAsk 全捕获，保证必然 settle）：真答案或超时空答案。
+      const mobileAnswerRaw = Promise.resolve().then(() => hostAsk(request, { signal: controller.signal }))
+        .catch(() => EMPTY_ANSWERS(request))
+      const isAnswered = (result) => Array.isArray(result?.answers)
+        && result.answers.some((entry) => (Array.isArray(entry?.selected) && entry.selected.length > 0)
+          || (typeof entry?.custom === 'string' && entry.custom !== ''))
+      // 关键：本侧「没答出来」（超时/未作答/异常 → 全空 selected 且无 custom）时
+      // **不得**抢走 race。若把它当赢家返回给宿主，宿主据此认为"用户没选"，
+      // 而此刻 Web 卡片还在等人作答——真机事故（2026-11-02 计划审批）：
+      // 用户后点的 Approve 落在孤儿卡上，答案无人消费，表现为「点了没生效，窗口消失」。
+      // 这里把「空答案」转成永不 settle：GUI 活着时让下游继续跑完；
+      // 只有下游确认死亡（downstreamDied$）才走 died 分支闭环宿主。
+      const telegramAnswer = mobileAnswerRaw.then((result) => (isAnswered(result) ? result : new Promise(() => {})))
       const downstream = downstreamOnce()
       // 输家卫生（两向）：原始 downstream 的 rejection 在此消费，绝不未处理；
       // race 内的派生 promise 对 rejection 转「永不 settle」——下游失败（GUI 异常 /
       // headless NO_PROVIDER）不判死提问，手机/管理台仍可作答。
-      downstream.catch(() => { /* race 输家，无需处理 */ })
+      // 下游死亡信号：GUI answerer 走到了 reject（headless 无 answerer 的 NO_PROVIDER、
+      // GUI 异常、请求被取消）。此时 Web 面已确认死亡，手机侧的超时空答案才可以
+      // 闭环宿主——否则宿主 ask() 会无限挂起。
+      let downstreamDiedNotify = () => {}
+      const downstreamDied$ = new Promise((resolve) => { downstreamDiedNotify = resolve })
+      downstream.catch(() => { downstreamDiedNotify(); })
       let downstreamWon = false
-      // 安全兜底：上面把「本侧未作答」转成了永不 settle，好让下游（GUI）跑完。
-      // 但若下游也没有 answerer（headless 宿主 / GUI 已关），race 就永远不 settle，
-      // 宿主 ask() 会被无限挂起——比"返回空答案"更糟。故加一个有界兜底定时器：
-      // 到点仍无任何一方给出答案时，返回空答案（保留"用户没选"的诚实语义）。
-      const FALLBACK_MS = Math.max(1000, Number(deps.unansweredFallbackMs) || 300_000)
-      const fallback = new Promise((resolve) => {
-        const timer = setTimeout(() => {
-          resolve({ answers: (Array.isArray(request?.questions) ? request.questions : [])
-            .map((question) => ({ id: String(question?.id ?? ''), selected: [] })) })
-        }, FALLBACK_MS)
-        // 不让这个兜底定时器吊住进程退出
+      // 防泄漏硬顶（不再是「替用户决定」的兜底）：上面已保证 GUI 活着时绝不注入空答案，
+      // 但宿主 crash-收尾/信号中断等极端路径仍可能让 race 双方都悬置。30 分钟硬顶只是
+      // 内存安全阀；到达时若 GUI 仍活着，同样只是退出 race、把控制权交回宿主当前语境，
+      // 不主动产生"用户没选"的答案——空答案由宿主自身语义处理。
+      // 真机事故复盘（2026-11-02 计划审批）：旧的 5 分钟定时器与插件内部提问超时等长，
+      // 到点抢答空答案 → 宿主认为"keep planning"，而 Web 卡片还活着 → 用户点击落在
+      // 孤儿卡上，答案无人消费，表现为「点了没生效，窗口消失」。
+      const LEASE_MS = Math.max(1000, Number(deps.unansweredFallbackMs) || 30 * 60_000)
+      const lease = new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('lease-expired'), LEASE_MS)
         if (typeof timer?.unref === 'function') timer.unref()
       })
       return Promise.race([
@@ -215,9 +224,26 @@ export function createNativeQuestionBridge(deps = {}) {
           (value) => { downstreamWon = true; return value },
           () => new Promise(() => { /* 下游失败：悬置，等本侧答案 */ }),
         ),
-        fallback,
+        downstreamDied$.then(() => 'downstream-died'),
+        lease,
       ]).then((winner) => {
+        // GUI 拿到答案：正常闭环，并收尾本侧等待。
         if (downstreamWon) {
+          try { controller.abort() } catch { /* 已终结则忽略 */ }
+          return winner
+        }
+        // 下游死亡或租约到点：GUI 已经/将不会再答了，此时手机侧结果（可能已答，
+        // 也可能是超时空答案）允许闭环宿主；两侧都没答就给空答案（宿主自行解释）。
+        if (winner === 'downstream-died' || winner === 'lease-expired') {
+          try { controller.abort() } catch { /* 已终结则忽略 */ }
+          // mobileAnswerRaw 必然 settle（真答案或超时空答案），直接等待它闭环宿主。
+          return mobileAnswerRaw
+        }
+        // 本侧先答（真答案）：收尾 GUI 卡片。
+        const answered = Array.isArray(winner?.answers)
+          && winner.answers.some((entry) => (Array.isArray(entry?.selected) && entry.selected.length > 0)
+            || (typeof entry?.custom === 'string' && entry.custom !== ''))
+        if (answered) {
           try { controller.abort() } catch { /* 已终结则忽略 */ }
         }
         return winner
