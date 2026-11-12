@@ -1,3 +1,38 @@
+## [0.13.1-qq.17]
+
+修复「网页问题卡片时有时无、总失效」——两个提问入口统一走原生 seam，网页与 QQ 双端同时出卡。
+
+### 根因
+
+网页问题卡片由宿主 `user-questions/request` 瀑布驱动（`dsh-client-ui-user-questions` 渲染），
+而插件自有 `ask_user` 工具的 execute 直调 `bridge.askQuestions`（只走 aq 桥推 QQ 卡片），
+**从不派发该瀑布**——它天然不出网页卡。网页卡片只在模型碰巧选官方 `ask_user_question` 时
+才出现；更糟的是 `ask_user` 的工具说明写着「用户装了 dsh-notifier 手机桥接时优先用本工具
+而不是 ask_user_question」，把模型系统性引向只发 QQ 的入口。于是「网页出不出卡」取决于
+模型选了哪个工具：会话日志实证（11/9 以来 6 次提问）2 次官方入口网页出卡（含用户在网页
+作答的 `aq:d7bd78c3`）、4 次插件入口网页无卡（含 2026-11-12 上午两次），表现为随机失效。
+
+### 修复
+
+- `ask_user` 改走宿主原生 seam（`ctx.userQuestions.askTimed/ask`）：问题经
+  `user-questions/request` 瀑布下发，网页问题卡片与 QQ 卡片（native-questions 拦截器
+  → aq 桥）同时出、先答为准；GUI 先答回灌（settleFromWeb）等既有机制全部复用
+  （`src/questions/router.mjs` 新增 `askViaNativeSeam`）。
+- 工具说明删去「优先用本工具而不是 ask_user_question」误导行，改为声明两入口出卡效果一致。
+- `hostAsk` 透传 `context` / `timeoutMs`：QQ 卡片引言与 `askTimed` 前台等待共用同一时限
+  （原生 `ask_user_question` 请求无此两字段，行为不变）。
+- 兼容语义保留：seam 缺失或调用前失败退回 aq 桥（仅 QQ 出卡，行为同旧版）；超时不代答
+  （`askTimed` 到期返回 answered=false，网页卡片仍留着可继续作答）；用户取消不重复出题；
+  选项 `description` 保留（网页灰字提示、QQ 折进卡片上下文）。
+
+### 验证
+
+- 真实链路实测（2026-11-12 14:44，插件 `ask_user` 入口——即旧缺陷路径）：网页弹出问题
+  卡片并作答，`state.json` 行 `aq:fabdbb1c` 落账 `decision:"answered"`, `via:"web"`，
+  同时 QQ 卡片照常推送（`pushedTo` 含 qq 投递）——同一路径此前网页必无卡。
+
+---
+
 ## [0.13.1-qq.16]
 
 修复「GUI 先答时 QQ 卡片误标 ⏹ 已终止」——多端同步作答回归（QQ→宿主一直正常，GUI→QQ 断了）。
