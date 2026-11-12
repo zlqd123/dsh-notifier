@@ -156,9 +156,7 @@ export function createCommandHandler(options = {}, strings) {
   const whoamiText = (envelope, bound) => {
     const head = t.commands.whoamiHead(getChannelName(envelope.channel, strings), envelope.userId)
     if (!bound) return t.commands.whoamiUnbound(head)
-    const accountId = String(envelope.accountId ?? 'default').trim() || 'default'
-    const record = identity.list(envelope.channel).find((item) => String(item.userId) === String(envelope.userId)
-      && String(item.accountId ?? 'default') === accountId)
+    const record = identity.find(envelope.channel, envelope.userId, envelope.accountId)
     const label = record !== undefined && record.label !== '' ? t.commands.labelSuffix(record.label) : ''
     return t.commands.whoamiBound(head, label, record?.role ?? 'member')
   }
@@ -240,9 +238,7 @@ export function createCommandHandler(options = {}, strings) {
       return t.commands.unpairNotBound
     }
     if (identity.ownerCount() <= 1) {
-      const accountId = String(envelope.accountId ?? 'default').trim() || 'default'
-      const record = identity.list(envelope.channel).find((item) => String(item.userId) === String(envelope.userId)
-        && String(item.accountId ?? 'default') === accountId)
+      const record = identity.find(envelope.channel, envelope.userId, envelope.accountId)
       if (record?.role === 'owner') {
         return t.commands.unpairLastOwner
       }

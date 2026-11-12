@@ -30,7 +30,7 @@ export const REMOTE_LOG_DEFAULT_LINES = 20
 
 /** 每渠道的 secret 键：这些字段在日志/诊断里必须脱敏。 */
 const SECRET_FIELDS = {
-  'qq-bot': ['appId', 'appSecret', 'gatewayToken'],
+  'qq-bot': ['appId', 'appSecret', 'gatewayToken', 'gatewaySecret'],
 }
 
 /** 取某渠道的 secret 键列表（未知渠道返回空数组）。 */
@@ -46,7 +46,9 @@ export function secretFieldsOf(type) {
 const FIELD_HINTS = {
   'qq-bot': {
     gatewayUrl: { required: true, secret: false, desc: 'noti-gateway 地址（如 http://gateway.example:10086）；出站唯一投递路径' },
-    gatewayToken: { required: true, secret: true, desc: 'noti-gateway 的 auth.token（Bearer 鉴权）' },
+    gatewayToken: { required: false, secret: true, desc: 'noti-gateway 的 auth.token（旧共享 token，Bearer 鉴权）' },
+    gatewaySecret: { required: false, secret: true, desc: 'HMAC 多密钥签名密钥（与 gatewayToken 二选一；填了即签名校验，网关优先走 HMAC）' },
+    gatewayKeyId: { required: false, secret: false, desc: 'HMAC 密钥代号（如 dsh/zcode/3-10），网关侧 hint 加速匹配' },
     gatewaySource: { required: false, secret: false, desc: '网关来源标识（默认 dsh），决定网关侧配额池归属' },
     appId: { required: false, secret: true, desc: 'QQ 开放平台开发者 ID——仅入站网关使用，出站不再需要' },
     appSecret: { required: false, secret: true, desc: '同页面 AppSecret——仅入站网关使用' },

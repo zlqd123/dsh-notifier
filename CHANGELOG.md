@@ -1,3 +1,150 @@
+## [0.13.1-qq.16]
+
+修复「GUI 先答时 QQ 卡片误标 ⏹ 已终止」——多端同步作答回归（QQ→宿主一直正常，GUI→QQ 断了）。
+
+### 根因
+
+`user-questions/request` waterfall 拦截器与 GUI answerer 双面抢答，GUI 先答时拦截器
+`controller.abort()` 收尾本侧等待，而 askQuestions 的 onAbort 一律
+`terminateDurable + bus.abandon`——账本行被终结成 `terminated`，已推 QQ 卡片改
+「⏹ 已终止：agent 会话已结束，提问取消」，可实际上宿主拿到了 GUI 答案、会话正常
+继续。事故行 `aq:c00eda90`（20:40:23 提问、20:41:31 terminated，68 秒远早于 5 分钟
+超时）即该路径。DSH 核心代码未改动（全树无 2026-11-07 之后的修改），断点只在
+插件侧 GUI→QQ 收尾维度。
+
+### 修复
+
+- GUI 胜出时把 Web 答案批次随 `abort` reason 传入（`{kind:'downstream-win', answers}`），
+  onAbort 据此走新增 `settleFromWeb`：按「先答先算」把在途问题结算成 answered
+  （via web）/skipped 并 `bus.settle` 唤醒 waitPromise——常规收尾把已推卡片改
+  「✅ 已作答：…（来源 web）」/「⏭ 已跳过」，绝不误标终态
+  （`src/questions/router.mjs` + `src/host/native-questions.mjs`）。
+- 答案对位：payload 问题带 `id`（GUI 答案批次按 id 对位在途行，索引兜底）；选项 label
+  按行选项映射下标，custom 走 aq-text（单选 custom 优先、多选两者一并呈现）；
+  空答案 → skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+- 首达不覆盖：行已有终态（QQ 同刻作答）时不改写，收尾仍按赢家终态呈现；结算直连
+  settle/settleText 同款原语（ledger.resolve 先落账、bus.settle 后唤醒），不经
+  `control.handle('question-answer')`（避免绕过授权语义与回环）。
+- 其余取消（会话销毁/下游死亡/显式中止）终止语义不变；迟到投递收尾共享 finalTextOf，
+  按真实终态呈现。
+
+### 验证
+
+- 真实链路实测（2026-11-10 07:58，Web GUI 先答）：`ask_user_question` 实测题在网页端选「同意」后，
+  `state.json` 新行 `aq:8e74248d` 落账 `decision:"answered"`, `via:"web"`, `userId:"web"`,
+  `answers:["同意"]`，作答后 28 秒内结账——非 5 分钟兜底、非 `terminated`，GUI→QQ 同步恢复。
+  QQ 卡片按 `finalTextOf` 收尾为「✅ 已作答：同意（来源 web）」（同一收尾通道此前已实测编辑生效）。
+- 回归对照：QQ 端先答（`via:"qq:button"` / `qq:text`）行为不变（`aq:6523281c`、`aq:d77e828f`）；
+  旧缺陷样本 `aq:c00eda90`（GUI 先答误落 `terminated`）作为根因证据保留。
+
+---
+
+## [0.13.1-qq.15]
+
+修复「同一答案收到两条回执」，并整理 README（QQ 消息审核机制、真实配额、网关部署坑位）。
+
+### 根因
+
+问答回执有两条独立发送路径叠加：questions 路由自己回一条裸 `✅ 已作答：…`
+（按钮 / 编号 / 自定义三个入口各一处），卡片收尾 `markResolved → editTarget →
+editResolved` 又发一条 `[审批结果] …（来源 …）`。有卡片的问题两条都发。
+
+### 修复
+
+- 三处裸回执改为条件发送：仅当 `ledger.get(qKey)?.pushedTo` 为空（无卡片投递、
+  纯编号兜底）时才发；有卡片的问题统一由 `[审批结果] …（来源 …）` 一条收口
+  （`src/questions/router.mjs` 按钮 / 编号 / 自定义三入口）。
+- 错误路径回执不变；判级与提权卡片不受影响。
+
+### 验证
+
+卡片自定义作答只收到一条 `[审批结果] ✅ 已作答（自定义）：…`；
+hint 编号兜底仍收到唯一裸回执。已实测。
+
+---
+
+## [0.13.1-qq.14]
+
+修复「升级后所有入站消息被判不在白名单」。
+
+### 根因
+
+v0.13（C11.5 / R2）把身份 principal 从 `(channel, userId)` 升级为
+`(channel, accountId, userId)`，非默认账号走 `<channel>:<accountId>:<userId>` 三元键；
+适配器同时开始上报真实账号标识（QQ 传 `appId`）。
+
+但**存量绑定行是升级前落的**，键是不带账号的 `qq:<userId>`，记录本身也没有 `accountId` 字段。
+`allows()` 在 `accountId` 非默认时直接拼三元键，必然打 miss：
+
+```
+state 里:  qq:1950B333...              → 命中
+查询时:    qq:<appId>:1950B333...   → miss → 判「不在白名单」
+```
+
+同一个键不匹配造成三处互不相干的表现，成因完全一致：
+
+| 表现 | 位置 |
+|---|---|
+| `拒绝入站消息：qq user ... 不在白名单` | `bus.allows` |
+| `/whoami` 把 owner 显示成 member | `commands.whoamiText` 自己按 `accountId ?? 'default'` 过滤 |
+| `/unpair` 报 not-found / 绕过末位 owner 守卫 | `commands.handleUnpair` 同款过滤 + `removeBinding` 拼键 |
+
+### 修复
+
+- 新增 `resolveBindingKey()`：先精确命中 `(channel, accountId, userId)`，未命中且查询的是
+  非默认账号时回落到渠道级键 `(channel, userId)`。回落**只放宽历史无账号记录**——带
+  `accountId` 的行仍是账号级精确绑定，多账号场景不会串到别的账号。
+- `allows` / `removeBinding` / `updateBinding` 统一走该解析；`addBinding` 的重复判定也走它，
+  避免给同一个身份再插一条账号级重复行。
+- 新增 `identity.find(channel, userId, accountId)`，`/whoami` 与 `/unpair` 改用它，
+  不再各自复制一套（错误的）过滤逻辑。
+
+### 验证
+
+对真实 `state.json` 副本跑 13 项断言全 PASS（含多账号隔离：`bot-A` 的行不被 `bot-B` 命中）；
+真实 bus 端到端 8 项全 PASS：入站消息被接受、业务扇出收到、`/whoami` 显示 owner、
+陌生人仍被拒、非引导态、`/unpair` 末位 owner 守卫生效。
+
+---
+
+## [0.13.1-qq.13]
+
+修复「QQ 按钮显示操作成功，实际没生效」。
+
+### 根因（端到端复现）
+
+`handleCardAction` 调 `deps.control.handle({...})` 时**漏传了 `trusted: true`**。
+于是 `question-answer` 的注册 spec 走的是非 trusted 分支：
+
+```js
+settle: (input) => input.trusted === true
+  ? settle(..., input.optIdxes, ...)            // ← 本该走这里
+  : decide({ ..., optIdx: input.optIdx, ... })  // ← 实际走了这里
+```
+
+而按钮路径只传 `optIdxes: [optIdx]`、不传 `optIdx`，`decide` 里变成 `[undefined]`
+→ `resolveIdxs` 返回 null → `invalid-option` → arbiter 判 `desktop_fallback`。
+
+QQ 客户端此时早已收到互动 ACK（`PUT /interactions`），所以显示"操作成功"——
+这正是「看着成功、实际没结算」的完整解释。
+
+### 修复
+
+- 按钮路径补回 `trusted: true`（授权/来源校验本就在 `handleCardAction` 上方完成：
+  token 校验、pushedTo 精确匹配、spec.authorize）。
+- 按钮路径成功回执改为从已结算账本行回读答案标签（与编号回复路径同款），
+  不再把「已作答或已过期」当成功话术。
+
+### 验证（真实生产链路端到端）
+
+| 入口 | 修复前 | 修复后 |
+|---|---|---|
+| QQ 按钮点选 | `answered=false`、`invalid-option`、账本 timeout | **`answered=true`、`answers=["Approve"]`** |
+| 编号回复「1」 | 正常 | 正常（未回归） |
+| 自定义「答: xxx」 | 正常 | 正常（未回归） |
+
+回执同步修正：按钮成功回执从「该提问已回答或已过期」变为「✅ 已作答：Approve」。
+
 # Changelog
 
 本副本基于 `dsh-notifier` 0.13.1（MIT）裁剪。上游完整变更史见

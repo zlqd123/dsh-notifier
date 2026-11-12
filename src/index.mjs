@@ -23,7 +23,7 @@ import { disposeAll } from './assembly/lifecycle.mjs'
 import { registerApprovalHandler } from './approval/router.mjs'
 import { createQuestionBridge, registerAskUserTool } from './questions/router.mjs'
 import { createNativeQuestionBridge } from './host/native-questions.mjs'
-import { registerConversationRouter } from './inbound/conversation.mjs'
+import { registerRemoteCommands } from './inbound/conversation.mjs'
 // v0.5：动作闭环（通知按钮 → 内置处置动作）
 import { createActionDispatcher } from './actions.mjs'
 import { createControlEntry } from './control/entry.mjs'
@@ -400,10 +400,8 @@ export function apply(ctx, config = {}) {
   let busRef = null
   let questionsBridge = null
   let nativeBridge = null
-  // v0.10 提交7：宿主事件 registrar 快照（管理台 /host 的 events.received 视图）
-  // 与图片入站能力标记（会话路由装配成功即 available）。惰性读取，装配前为 null/false。
+  // v0.10 提交7：宿主事件 registrar 快照（管理台 /host 的 events.received 视图）。惰性读取，装配前为 null。
   let hostEventsRegistrar = null
-  let conversationRouterActive = false
   const questionsForChannels = {
     decide: (payload) => questionsBridge?.decide(payload) ?? { ok: false, message: strings.index.questionsNotReady },
   }
@@ -719,7 +717,10 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    // 阶段 5：会话路由——白名单用户的文本按 idle/busy 语义投进 agent（followup/inject/steer）
+    // 阶段 5（2026-06 收窄）：远程命令路由——仅 /stop（取消当前 turn）与 /quiet //unquiet
+    // （会话出站推送静默/恢复）。会话路由（文本 → agent 投递）已整体移除：专注通知 +
+    // 卡片裁决，非命令消息一律静默。卡片编号裁决（审批/提权/提问/动作）由 approval/* 与
+    // questions/router 各自的 bus 高优先级处理器完成，不经此模块。
     const replyViaChannel = async (channel, chatId, text) => {
       const target = replyTargets.get(channel)
       if (target !== undefined) {
@@ -730,30 +731,19 @@ export function apply(ctx, config = {}) {
       warn(`回执无可用通道：${channel}（已启用回执通道：${known !== '' ? known : '无'}）`)
     }
     try {
-      const disposeConversation = registerConversationRouter({
+      const disposeRemoteCommands = registerRemoteCommands({
         ctx,
         bus,
         store,
         reply: replyViaChannel,
-        config: inboundRaw.conversation,
-        router, // v0.3.2 入站解析链（bind > 通道默认 > 单 agent > 最近活跃）
-        registry, // 会话台账（/agent 命令族数据源、活跃信号、入站对话挂钩）
+        router, // 入站解析链（bind > 通道默认 > 单 agent > 最近活跃）：/stop 定位目标会话
+        registry, // 会话台账（活跃信号、/quiet 目标匹配数据源）
         control,
-        channelTypes: () => outboundSource.types(), // 全局渠道池动态白名单（分流过滤随热应用收敛）
-        // v0.10 移动任务路由（任务书提交5）：歧义前置选择卡 + /tasks ⚠ 待关注标记
-        taskSelection,
-        attentionOf,
-        // Commit20：/log 三重依赖——identity（owner 判定，channel-scoped）、ledger（只读
-        // recent() 数据源）、remoteLog（开关与上限）。三者任一缺失即 fail-closed。
-        identity,
-        ledger,
-        remoteLog: resolved.remoteLog,
         logger,
       }, strings)
-      disposers.push(disposeConversation)
-      conversationRouterActive = true // 提交7：会话路由（含图片投递）已装配 → 管理台图片入站标 available
+      disposers.push(disposeRemoteCommands)
     } catch (error) {
-      warn(`会话路由装配失败，已跳过（inbound 通道与审批不受影响）: ${error instanceof Error ? error.message : String(error)}`)
+      warn(`远程命令路由装配失败，已跳过（通知与审批不受影响）: ${error instanceof Error ? error.message : String(error)}`)
     }
   } else if (approvalWanted) {
     // v0.7：无任何入站通道凭证时不启动（无回传通道可承载裁决）；有凭证即进入引导态。
@@ -910,7 +900,7 @@ export function apply(ctx, config = {}) {
         hostSnapshot: () => (hostEventsRegistrar !== null ? hostEventsRegistrar.snapshot() : null),
         questionsFallbackEnabled: questionsBridge !== null, // 插件自有 ask_user 工具已注册
         webLocal: 'available', // 管理台本机回环（此 API 自身已在本机运行）
-        imageInput: conversationRouterActive ? 'available' : 'unknown', // 图片入站随会话路由装配
+        imageInput: 'unknown', // 图片入站随会话路由移除（不再向 agent 会话投递图片/文件）
       })
       surfaceAdminApi = adminApi
       adminApi.testOutboundChannel = async (type) => {
@@ -998,7 +988,7 @@ export { registerApprovalHandler } from './approval/router.mjs'
 export { createEscalationChain } from './approval/escalation.mjs'
 export { createQuestionBridge, registerAskUserTool } from './questions/router.mjs'
 export { createNativeQuestionBridge } from './host/native-questions.mjs'
-export { registerConversationRouter } from './inbound/conversation.mjs'
+export { registerRemoteCommands } from './inbound/conversation.mjs'
 export { segmentText, countCodepoints, sendSegmented } from './inbound/segment.mjs'
 // v0.6：开放事件源（供测试与其它插件复用）
 export { PUBLIC_API_VERSION, createPublicFacade, composeOnSend, deepFreeze } from './public.mjs'

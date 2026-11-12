@@ -35,6 +35,9 @@ import { createInteractionLedger } from '../interaction/ledger.mjs'
 import { createRateLimiter, compileParameters } from '../tool-register.mjs'
 // 维护批 6 前置：跨渠道能力矩阵作为单一事实来源
 import { isCoveredByOutbound, toInboundChannelName } from '../inbound/capability-matrix.mjs'
+// 问题卡片根因修复（0.13.1-qq.17）：ask_user 优先走宿主原生 user-questions/request 瀑布，
+// 让网页 GUI 问题卡片与 QQ 卡片同时出（先答为准）；seam 缺失才退回 aq 桥（仅 QQ）。
+import { readUserQuestions } from '../host/capability.mjs'
 
 const KEY_PREFIX = 'aq:'
 
@@ -588,7 +591,37 @@ export function createQuestionBridge(deps, strings) {
       feedback(t.alreadyAnsweredFirstWin)
       return true
     }
-    const verdict = deps.control.handle({ eventId: String(envelope.messageId ?? ''), command: 'question-answer', qKey, optIdx, token: String(action.token ?? ''), via: `${envelope.channel}:button`, channel: envelope.channel, accountId: envelope.accountId, userId: envelope.userId, chatId: envelope.chatId, chatType: envelope.chatType })
+    // P0 修复（2026-11-04）：这里传的必须是 **optIdxes 复数数组**。Control Core 放行后
+    // 调用的 spec.settle 读 `input.optIdxes`；旧实现传 `optIdx` 单数 → settle 端拿到
+    // undefined → resolveIdxs 返回 null → 'invalid-option' → desktop_fallback，结算
+    // 永远失败，而 QQ 端的互动 ACK（点击回执）早已成功——表现即「显示操作成功，实际没生效」。
+    // 对照：编号回复路径传的本来就是 optIdxes 数组，所以只有按钮路径坏。
+    const verdict = deps.control.handle({
+      eventId: String(envelope.messageId ?? ''),
+      command: 'question-answer',
+      qKey,
+      optIdxes: [optIdx],
+      token: String(action.token ?? ''),
+      via: `${envelope.channel}:button`,
+      channel: envelope.channel,
+      accountId: envelope.accountId,
+      userId: envelope.userId,
+      chatId: envelope.chatId,
+      chatType: envelope.chatType,
+      trusted: true,
+    })
+    if (verdict.ok === true || verdict.status === 'accepted') {
+      // Control Core 的 accepted 回执不带结算明细——答案标签从已结算账本行回读
+      //（与编号回复路径同款，避免把「已作答或已过期」当成功话术发给用户）。
+      const row = ledger.get(qKey)
+      const answers = Array.isArray(row?.answers) ? row.answers.map(String) : []
+      // 去重（2026-11-09）：卡片问题的终态回执由 markResolved 发「[审批结果] …（来源 …）」，
+      // 这里再发裸「✅ 已作答」就是同一答案两条。仅无卡片投递（hint 编号兜底）时保留裸回执。
+      if (!Array.isArray(row?.pushedTo) || row.pushedTo.length === 0) {
+        feedback(t.answeredWithLabels(answers))
+      }
+      return true
+    }
     feedback(receiptFeedback(verdict, t.answeredOrExpired))
     return true
   }
@@ -652,6 +685,61 @@ export function createQuestionBridge(deps, strings) {
     bus.settle(qKey, { kind: 'aq-skip', idxs: [] }, `${envelope.channel}:button`, envelope.userId)
     warn(`${qKey} 已跳过（via ${envelope.channel}:button）`)
     return { ok: true, message: t.skippedFeedback }
+  }
+
+  /** GUI 先答的跨端结算（waterfall 下游胜出经 abort reason 回灌，2026-11-10 多端同步
+   *  回归修复）：把 Web 侧答案按「先答先算」结算进 aq 行并唤醒 waitPromise，让
+   *  askQuestions 的常规收尾把已推卡片改「✅ 已作答：…（来源 web）」/「⏭ 已跳过」——
+   *  绝不把 Web 作答误标成「⏹ 已终止」。直连 settle/settleText 同款原语（I5 durable
+   *  first-winner：ledger.resolve 先落账、bus.settle 后唤醒）；不经
+   *  control.handle('question-answer')（那是手机/管理台入口，回灌会绕过授权语义）。
+   *  GUI 答案形如 {id, selected: 选项 label[], custom?}：单选 + custom 与 GUI
+   *  composer 同语义（custom 优先、丢弃 selected），多选两者一并呈现；空答案
+   *  （跳过/未答）→ skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+   *  @returns {boolean} 是否已按真实终态收尾（false → 调用方终止兜底） */
+  function settleFromWeb(qKey, question, qIndex, guiAnswers) {
+    const row = ledger.get(qKey)
+    if (row === undefined) return false
+    // 行已有终态（QQ 侧首达已采纳/已终止）：不覆盖，常规收尾按既有终态呈现即可。
+    if (row.status !== 'pending') return true
+    const list = Array.isArray(guiAnswers) ? guiAnswers : []
+    const qId = String(question?.id ?? '')
+    const entry = (qId !== '' ? list.find((a) => String(a?.id ?? '') === qId) : undefined) ?? list[qIndex]
+    const selected = Array.isArray(entry?.selected) ? entry.selected.map((v) => String(v)).filter((v) => v !== '') : []
+    const optIdxes = selected.map((label) => row.options.indexOf(label)).filter((idx) => idx >= 0)
+    const useIdxes = row.multiSelect === true ? optIdxes : optIdxes.slice(0, 1)
+    const webAs = { channel: 'web', userId: 'web' }
+    const safe = sanitizeAnswerText(typeof entry?.custom === 'string' ? entry.custom : '')
+    if (safe.removed > 0) {
+      warn(`${qKey} Web 作答含 ${safe.removed} 个控制/零宽字符，已过滤（S-07 注入边界）`)
+    }
+    const custom = safe.tooLong ? '' : safe.text.trim()
+    // 首达已被采纳（QQ 同刻作答，ledger/赢家已 settle）→ 无事可做，收尾按赢家终态呈现。
+    const handled = (result) => result === true
+      || result === 'already-resolved' || result === 'already-claimed'
+      || (result !== null && typeof result === 'object' && (result.ok === true || result.reason === 'already-resolved'))
+    if (custom !== '' && (row.multiSelect !== true || useIdxes.length === 0)) {
+      // 单选 + 自定义：与 GUI composer 同语义（custom 优先）；或有自定义但 label
+      // 全部无法对位行选项 → 纯自定义。
+      return handled(settleText(qKey, custom, webAs))
+    }
+    if (useIdxes.length > 0) {
+      if (custom === '') return handled(settle(qKey, row, useIdxes, 'web', 'web'))
+      // 多选 + 自定义：GUI 两者都保留——answers 携带 labels + 自定义文本（不置
+      // custom 位，finalTextOf 走 answeredWithLabelsVia，卡片可见全部内容）。
+      const answersAll = [...useIdxes.map((idx) => row.options[idx]), custom]
+      const committed = ledger.resolve(qKey, 'answered', { answers: answersAll, via: 'web', userId: 'web' })
+      if (committed !== true) return handled(committed)
+      bus.settle(qKey, { kind: 'aq', idxs: useIdxes }, 'web', 'web')
+      warn(`${qKey} 作答：${answersAll.join('、')}（via web）`)
+      return true
+    }
+    // GUI 空答案（跳过/未答）→ skipped 语义（交还桌面、绝不编造），绝不伪装已作答。
+    const committedSkip = ledger.resolve(qKey, 'skipped', { via: 'web', userId: 'web' })
+    if (committedSkip !== true) return handled(committedSkip)
+    bus.settle(qKey, { kind: 'aq-skip', idxs: [] }, 'web', 'web')
+    warn(`${qKey} 已跳过（via web）`)
+    return true
   }
 
   // ———————————————— 管理台待决问题 facade（路线图阶段 2A，2026-08-26） ————————————————
@@ -885,7 +973,12 @@ export function createQuestionBridge(deps, strings) {
       settle: () => settleText(qKey, answer, envelope),
     })
     if (verdict.ok === true || verdict.status === 'accepted') {
-      if (inbound !== undefined) void inbound.sendText(envelope.chatId, t.answeredCustom(answer)).catch(() => {})
+      // 去重（2026-11-09）：卡片问题由 markResolved 发「[审批结果] ✅ 已作答（自定义）…」，
+      // 仅无卡片投递时保留裸回执。
+      const pushed = ledger.get(qKey)?.pushedTo
+      if (inbound !== undefined && (!Array.isArray(pushed) || pushed.length === 0)) {
+        void inbound.sendText(envelope.chatId, t.answeredCustom(answer)).catch(() => {})
+      }
     } else {
       // 已决/来源不满足 → fail-closed：消费消息、提示不可再答
       if (inbound !== undefined) void inbound.sendText(envelope.chatId, receiptFeedback(verdict, t.alreadyAnsweredFirstWin)).catch(() => {})
@@ -1015,7 +1108,10 @@ export function createQuestionBridge(deps, strings) {
       //（settle → ledger.resolve 同步写入 answers），避免主数据回执出现「✅ 已作答：」空标签。
       const row = ledger.get(pending.key)
       const answers = Array.isArray(row?.answers) ? row.answers : []
-      sendFeedback(t.answeredWithLabels(answers))
+      // 去重（2026-11-09）：同按钮路径——卡片问题只留 markResolved 的「[审批结果] …」一条。
+      if (!Array.isArray(row?.pushedTo) || row.pushedTo.length === 0) {
+        sendFeedback(t.answeredWithLabels(answers))
+      }
       return true
     }
     // 罕见竞态（作答瞬间恰好超时）：回执说明，同样消费避免把裸编号漏进对话路由
@@ -1058,7 +1154,7 @@ export function createQuestionBridge(deps, strings) {
     const results = []
     let allAnswered = true
     const agentId = execContext?.agent?.id ?? execContext?.agent?.session?.id ?? execContext?.session?.id ?? null
-    for (const question of questions) {
+    for (const [qIndex, question] of questions.entries()) {
       if (disposed || execContext.signal?.aborted === true) {
         results.push({ question: String(question?.question ?? ''), answered: false, reason: 'stopped' })
         allAnswered = false
@@ -1103,8 +1199,13 @@ export function createQuestionBridge(deps, strings) {
         })
         // 拦截器范围取消信号——注册必须先于任何投递启动
         // （webFirstMs=0 的直投路径 launchPush() 之前就要挂好）。abort 时：清延迟推卡/
-        // 停升级（cancelDelivery）、**先**终结账本行（bus.abandon 默认 manual reason 不
-        // 触发 onAbandon——必须显式 terminate）、再 abandon 等待。
+        // 停升级（cancelDelivery）；GUI 先答（reason.kind='downstream-win'，随 abort
+        // 携带 Web 答案批次）→ settleFromWeb 按「先答先算」把在途问题结算成 answered
+        // （via web）/skipped，bus.settle 唤醒 waitPromise 走常规收尾——已推卡片改
+        // 「✅ 已作答：…（来源 web）」，绝不误标「⏹ 已终止」（2026-11-10 多端同步回归）。
+        // 其余取消（会话销毁/下游死亡/显式中止）保持终止语义：**先**终结账本行
+        // （bus.abandon 默认 manual reason 不触发 onAbandon——必须显式 terminate）、
+        // 再 abandon 等待。
         // 取消保证（诚实表述）：取消后不再「发起」任何新投递（卡/广播/编号话术）；
         // 在途 HTTP 发送不可撤回，迟到成功的投递由 runPush 收尾路径按终态 best-effort 编辑。
         let onAbort = null
@@ -1112,6 +1213,12 @@ export function createQuestionBridge(deps, strings) {
         if (signal !== undefined && signal !== null && typeof signal.addEventListener === 'function') {
           onAbort = () => {
             cancelDelivery()
+            const reason = signal.reason
+            if (reason !== null && typeof reason === 'object' && reason.kind === 'downstream-win') {
+              // GUI 真答案 → 跨端结算；返回 true 表示行已按真实终态收尾（waiter 已被
+              // 唤醒/已有赢家终态），绝不再终止账本行。
+              if (settleFromWeb(qKey, question, qIndex, reason.answers) === true) return
+            }
             terminateDurable(qKey)
             try { bus.abandon(qKey) } catch { /* 已终结则忽略 */ }
           }
@@ -1267,7 +1374,10 @@ export function validateAskArgs(rawArgs, { minTimeoutMs = 30_000, maxTimeoutMs =
       if (label === '' || label.length > 60) {
         return { ok: false, reason: `问题「${question.slice(0, 20)}」的选项 label 必须是 1-60 字符` }
       }
-      options.push({ label })
+      // 选项 description 保留（可选）：原生 seam 出卡时网页端显示灰字提示、
+      // QQ 卡片经 hostAsk 折进上下文，避免双端出卡丢细节。
+      const description = String(option?.description ?? '').trim()
+      options.push(description === '' ? { label } : { label, description })
     }
     questions.push({ question, options, multiSelect: item?.multiSelect === true })
   }
@@ -1277,6 +1387,74 @@ export function validateAskArgs(rawArgs, { minTimeoutMs = 30_000, maxTimeoutMs =
     : defaultTimeoutMs
   const context = String(args.context ?? '').slice(0, 300)
   return { ok: true, questions, timeoutMs, context }
+}
+
+/**
+ * 把 ask_user 请求映射到宿主原生 user-questions/request 瀑布（0.13.1-qq.17 根因修复）：
+ * 网页 GUI 问题卡片由下游渲染、QQ 卡片由 native-questions 拦截器经 aq 桥推送，
+ * 首达采纳、GUI 先答回灌（settleFromWeb）全部复用既有机制——两个提问工具出卡效果一致，
+ * 模型选哪个都不再影响网页问题卡片。
+ * @returns {Promise<object|null>} ask_user 输出形状；seam 缺失或调用前失败返回 null
+ *   （调用方退回 aq 桥，仅 QQ 出卡）；用户取消返回明确失败对象（问题可能已出卡，
+ *   绝不退回重复出题）。
+ */
+async function askViaNativeSeam(ctx, validated, execContext) {
+  const uq = readUserQuestions(ctx)
+  if (uq === null || typeof uq.ask !== 'function') return null
+  const agent = execContext?.agent
+  if (agent === undefined || agent === null) return null // 无 agent 卡片无法归属会话，退回 aq 桥
+  const callId = typeof execContext?.callId === 'string' ? execContext.callId : null
+  const request = {
+    questions: validated.questions.map((item, idx) => ({
+      id: `q${idx + 1}`,
+      question: item.question,
+      options: item.options.map((option) => (
+        option.description === undefined
+          ? { label: option.label }
+          : { label: option.label, description: option.description }
+      )),
+      multiSelect: item.multiSelect,
+    })),
+    // context / timeoutMs 为 ask_user 附加字段（原生 ask_user_question 请求没有）：
+    // hostAsk 把它们透传给 questionBridge，QQ 卡片引言与前台等待共用同一时限。
+    context: validated.context,
+    timeoutMs: validated.timeoutMs,
+    agent,
+  }
+  if (execContext?.signal !== undefined) request.signal = execContext.signal
+  if (callId !== null) request.wait = { callId }
+  let result
+  try {
+    // askTimed：前台等待到期返回 { pending:true }（超时不代答），卡片仍可继续作答；
+    // 无 callId 或旧宿主无 askTimed 时退回 ask()（等到作答或信号取消）。
+    result = callId !== null && typeof uq.askTimed === 'function'
+      ? await uq.askTimed(request, callId, validated.timeoutMs)
+      : await uq.ask(request)
+  } catch (error) {
+    const code = error?.code
+    if (code === 'ASK_ABORTED' || code === 'ASK_CANCELLED') {
+      // 用户取消了这次调用：问题可能已在网页出卡，绝不退回 aq 桥重复出题
+      return { ok: false, answered: false, results: [], reason: '提问已被取消' }
+    }
+    return null // 调用前失败（无应答方 / agent 不匹配等）→ 退回 aq 桥
+  }
+  const unanswered = () => validated.questions.map((item) => ({ question: item.question, answered: false, answers: [] }))
+  if (result?.pending === true) {
+    return { ok: true, answered: false, results: unanswered() }
+  }
+  const rawAnswers = Array.isArray(result?.answers) ? result.answers : []
+  const byId = new Map()
+  for (const entry of rawAnswers) {
+    if (entry !== null && typeof entry === 'object' && typeof entry.id === 'string') byId.set(entry.id, entry)
+  }
+  const results = validated.questions.map((item, idx) => {
+    const entry = byId.get(`q${idx + 1}`) ?? rawAnswers[idx] ?? null
+    const selected = Array.isArray(entry?.selected) ? entry.selected.map(String) : []
+    const custom = typeof entry?.custom === 'string' && entry.custom !== '' ? entry.custom : ''
+    const answers = custom === '' ? selected : [...selected, custom]
+    return { question: item.question, answered: answers.length > 0, answers }
+  })
+  return { ok: true, answered: results.every((item) => item.answered), results }
 }
 
 /**
@@ -1293,7 +1471,7 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
   const limiter = createRateLimiter({ limitPerMinute: options.rateLimitPerMinute ?? 6 })
   return ctx.tools.register({
     name: 'ask_user',
-    description: '向用户提出选择题并等待作答（推送到用户手机：飞书选项卡片 / Telegram 按钮 / 其他渠道回复编号）。适合方案抉择、环境选择等需要用户拍板的分叉决策；用户装了 dsh-notifier 手机桥接时优先用本工具而不是 ask_user_question。超时不会代答——用户未作答时返回 answered=false，请改用桌面确认或调整方案继续。',
+    description: '向用户提出选择题并等待作答：网页会话弹出问题卡片，同时推送用户手机（飞书选项卡片 / Telegram 按钮 / 其他渠道回复编号），两端同步、先答为准。适合方案抉择、环境选择等需要用户拍板的分叉决策；与 ask_user_question 出卡效果一致，任选其一即可。超时不会代答——用户未作答时返回 answered=false，请改用桌面确认或调整方案继续。',
     parameters: compileParameters({
       questions: {
         type: 'array',
@@ -1339,6 +1517,10 @@ export function registerAskUserTool(ctx, bridge, options = {}) {
         return { ok: false, answered: false, results: [], reason: validated.reason }
       }
       try {
+        // 双端出卡优先：走宿主原生 seam（网页问题卡片 + QQ 卡片同时出、先答为准）；
+        // seam 缺失/调用前失败返回 null，退回 aq 桥（仅 QQ 出卡，行为同旧版）。
+        const native = await askViaNativeSeam(ctx, validated, execContext)
+        if (native !== null) return native
         return await bridge.askQuestions(validated, execContext)
       } catch (error) {
         return { ok: false, answered: false, results: [], reason: error instanceof Error ? error.message : String(error) }

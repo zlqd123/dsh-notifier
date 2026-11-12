@@ -149,7 +149,7 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 
 ### 出站 `channels`（仅 `qq-bot`，一律经 noti-gateway）
 
-出站**只有一条路径**：统一通知网关。直连 QQ 官方 API 的实现已整体移除，
+出站**只有一条路径**：统一通知网关（[zlqd123/noti-gateway](https://github.com/zlqd123/noti-gateway)）。直连 QQ 官方 API 的实现已整体移除，
 网关不可达即本条失败（不存在"静默回退直连"的第二条链路）。
 
 | 字段 | 必填 | 说明 |
@@ -183,7 +183,7 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 
 - **事件推送**：`turnEnd`（完成/失败/中断，可按原因分控）、`approval`（需要批准）、`longRunning`/`stall`（长任务心跳与卡住提醒）等。默认 `turnEnd.completed` 开。
 - **工具**：模型可主动调用 `notify`（发通知）与 `notify_test`（健康自检）。两者都受滑动窗口限流（默认 10 次/分钟），防止把渠道刷成垃圾出口。
-- **远程审批与提问**：QQ 侧用编号回复裁决（`1`/`2`），按钮卡片经 `INTERACTION_CREATE` 回执。
+- **远程审批与提问**：QQ 侧用编号回复裁决（`1`/`2`），按钮卡片经 `INTERACTION_CREATE` 回执。问答收尾回执**统一一条**：有卡片的问题只发 `[审批结果] …（来源 …）`（0.13.1-qq.15 起不再重复发裸 `✅ 已作答`；无卡片的编号兜底仍发裸回执）。
 
 ---
 
@@ -212,6 +212,9 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 | 日志 `网关投递失败` | noti-gateway 不可达 / token 错 | 核对 `gatewayUrl` 连通性与 `gatewayToken`；**不会回退直连** |
 | 日志 `QQ 网关闭码 4009 / 服务端要求重连（op7）` | QQ 平台常规会话轮转，非故障 | 只首次打 warn，后续降 debug；如频繁且收不到消息再查机器人登录态 |
 | 日志 `qq-bot 返回错误 <code>` | 凭证错 / 目标 openid 失效 / 被限流 | 按错误码到开放平台核对 |
+| 日志 `qq-bot 返回错误 40034006` | 消息内容未过 QQ 平台内容安全审核（发送是先审后发） | 改写内容后重发；这类错误重试无意义 |
+| 「✅ 任务完成」等事件推送收不到 | 出站唯一路径是网关：`gatewayUrl` 不可达（服务端只绑 `127.0.0.1` 时外网必失败）或 `gatewayToken` 失效 | `curl {gatewayUrl}/_health`；服务端绑 `0.0.0.0` 并放行防火墙/安全组，核对 token |
+| 同一答案收到两条回执（裸 `✅` + `[审批结果]`） | 0.13.1-qq.14 及更早的双路径叠加 | 升级 0.13.1-qq.15：有卡片只发 `[审批结果]` 一条 |
 | 只看到「换 token 失败」 | appId / appSecret 不匹配 | 核对开发设置页 |
 | 工具报 `returned invalid output: value is not lossless JSON` | 已修复（0.13.1-qq.2）：旧版在未传 `channel` 时返回 `channel: undefined` | 升级到本版 |
 | 插件卡片显示「启动时没能加载」 | `cordis.patch.yml` 的 `id`/`name` 与 package.json 包名不一致 | 三处同名（见「安装」） |
@@ -225,6 +228,12 @@ bundle 自带的 `cordis.patch.yml` 会插入默认行（`channels: []`）。**�
 - 模块：120 → 85（`config.mjs` 只留 `qq-bot` 注册表；入站 `INBOUND_CHANNELS` 只剩 `qq`；五个渠道适配器、五个入站 transport、扫码流、声明表引擎全部移除）。
 - 无死代码：从 `src/plugin-entry.mjs` 出发可达性分析，全部可达。
 - 运行时依赖：0（不再需要读 YAML——配置由宿主 cordis 解析后作为 `config` 传入；原先用于读原插件 patch 的 `src/compat/` 已随「配置自持」一并移除）。
+
+---
+
+## 相关项目
+
+- **[zlqd123/noti-gateway](https://github.com/zlqd123/noti-gateway)**——统一通知网关：本插件出站的唯一投递目标（`POST /n/{source}`），另提供 SSE 事件流、失败死信与私聊归档（chatdownload）。服务端部署与协议细节见其[接入文档](https://github.com/zlqd123/noti-gateway/blob/main/接入文档.md)。
 
 ---
 

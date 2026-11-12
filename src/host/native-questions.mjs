@@ -103,12 +103,22 @@ export function createNativeQuestionBridge(deps = {}) {
     })
     const payload = {
       questions: normalized.map((entry) => ({
+        // id 透传给 questionBridge：GUI 先答回灌（settleFromWeb）按 id 把答案批次
+        // 对位到在途问题行（索引兜底），否则多问请求会错位。
+        id: entry.id,
         question: entry.question,
         options: entry.options.labels.map((label) => ({ label })),
         multiSelect: entry.multiSelect,
       })),
-      context: normalized.map((entry) => entry.detail).filter((part) => part !== '').join('\n'),
-      // 原生提问超时由 questionBridge 的默认策略兜底（宿主 signal 取消见 review 收口）。
+      context: [String(request?.context ?? ''), ...normalized.map((entry) => entry.detail)]
+        .filter((part) => part !== '').join('\n'),
+    }
+    // ask_user 经本 seam 出题时会带上 timeoutMs（原生 ask_user_question 请求没有该字段）：
+    // 透传给 questionBridge，让 QQ 卡片作答时限与 askTimed 前台等待共用同一时限；
+    // 缺失时由 questionBridge 默认策略兜底（宿主 signal 取消见 review 收口）。
+    const requestTimeoutMs = Number(request?.timeoutMs)
+    if (Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0) {
+      payload.timeoutMs = requestTimeoutMs
     }
     let outcome
     try {
@@ -155,9 +165,12 @@ export function createNativeQuestionBridge(deps = {}) {
    * answerer（next()）race，先答先算：
    *  - 手机/管理台先答 → 本侧答案上交宿主（下游成为输家，catch 兜底防未处理拒绝；
    *    GUI 卡片能否自动收起属宿主 ask() signal 语义，见模块头「已知限制」）。
-   *  - GUI 先答 → 下游答案上交宿主；abort 拦截器范围取消信号——askQuestions 侧清
-   *    延迟推卡（Stage 0→1 pushTimer）、停升级、abandon 等待（账本行终结），多问
-   *    请求的后续问题不再开（router 循环头 aborted 检查）。绝不迟推卡。
+   *  - GUI 先答 → 下游答案上交宿主；abort 拦截器范围取消信号（reason 携带 Web 答案
+   *    批次）——askQuestions 侧清延迟推卡（Stage 0→1 pushTimer）、停升级，并把在途
+   *    问题按「先答先算」跨端结算（settleFromWeb：answered via web / skipped）：已推
+   *    QQ 卡片改「✅ 已作答：…（来源 web）」/「⏭ 已跳过」，绝不误标「⏹ 已终止」
+   *    （2026-11-10 多端同步回归修复）；多问请求的后续问题不再开（router 循环头
+   *    aborted 检查）。绝不迟推卡。
    *  - 下游先 reject（GUI answerer 异常 / headless 宿主无 answerer 的 NO_PROVIDER）
    *    → 不判死整场 race：下游转为永不 settle，等手机/管理台作答兜底。
    *  - 空请求 / 无入站交互通道（canDeliver 假）→ 原样透传 next()，GUI-only 宿主
@@ -229,7 +242,13 @@ export function createNativeQuestionBridge(deps = {}) {
       ]).then((winner) => {
         // GUI 拿到答案：正常闭环，并收尾本侧等待。
         if (downstreamWon) {
-          try { controller.abort() } catch { /* 已终结则忽略 */ }
+          // reason 随 abort 传给 askQuestions 的 onAbort：在途问题按 Web 答案批次
+          // 跨端结算（answered via web / skipped，卡片改「✅ 已作答：…（来源 web）」），
+          // 而不是终止账本行——2026-11-10 多端同步回归修复（此前一律 terminate，
+          // QQ 卡片误标「⏹ 已终止：agent 会话已结束」）。
+          try {
+            controller.abort({ kind: 'downstream-win', answers: Array.isArray(winner?.answers) ? winner.answers : [] })
+          } catch { /* 已终结则忽略 */ }
           return winner
         }
         // 下游死亡或租约到点：GUI 已经/将不会再答了，此时手机侧结果（可能已答，
